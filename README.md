@@ -20,12 +20,15 @@ A multi-node ESP32 smart home safety and biometric/vehicle access-control system
    - **Recognized Face** → ESP-NOW triggers **Door Servo 3 (`GPIO26`)** on the Main Hub.
    - **Unknown Face** (`2` consecutive detections, `4 s` cooldown) → ESP-NOW triggers the **4 s Siren Buzzer (`GPIO25`)**.
 
-3. **Camera 2 — Standalone On-Device License Plate Recognition (`[env:cam_plate]`, [`src/cam_plate/`](src/cam_plate/main.cpp))**
-   - Runs 100% locally on-device (`320×240` grayscale in PSRAM, [`plate_ocr.cpp`](src/cam_plate/plate_ocr.cpp)) with horizontal edge-energy ROI localization, Otsu adaptive thresholding, 2D connected-component character segmentation, and `16×16` zero-mean NCC template OCR (`0–9`, `A–Z`).
-   - Stores up to **20 authorized plate strings** and OCR/camera calibration in NVS Flash across reboots.
-   - Hosts a Web UI at **`http://192.168.4.102`** (live bounding-box + character preview, Add/Delete/Use Last Read plate manager, test buttons, polarity/fuzzy/flash settings).
-   - **Authorized Plate** (`2` consecutive valid reads) → ESP-NOW opens the **2-Servo Car Gate (`GPIO18` & `GPIO19`)**.
-   - **Unknown Plate** (`2` consecutive valid reads, `4 s` cooldown) → ESP-NOW triggers the **4 s Siren Buzzer (`GPIO25`)**.
+3. **Camera 2 — License Plate OCR, QR Code & Barcode Recognition (`[env:cam_plate]` / `[env:cam_plate_qr]`, [`src/cam_plate/`](src/cam_plate/main.cpp))**
+   - Runs 100% locally on-device (`320×240` grayscale in PSRAM):
+     - **QR Code & 1D Barcode Decoder ([`plate_code.cpp`](src/cam_plate/plate_code.cpp) + PSRAM-backed [`quirc`](src/cam_plate/quirc/))**: Decodes **QR codes** (`quirc`, any rotation), **Code 128** (Sets A/B/C, Mod-103 checksum), and **Code 39** barcodes containing the plate number (e.g. `ABC1234` or `PLATE:ABC1234`).
+     - **License Plate OCR Fallback ([`plate_ocr.cpp`](src/cam_plate/plate_ocr.cpp))**: Horizontal edge-energy ROI localization, Otsu adaptive thresholding, 2D connected-component character segmentation, and `16×16` zero-mean NCC template OCR (`0–9`, `A–Z`).
+   - Supports live **Recognition Mode** switching saved to NVS Flash: **`Auto (QR / Barcode → OCR)`** (default in `[env:cam_plate]`), **`QR Code / Barcode Only`** (default in `[env:cam_plate_qr]`), or **`Plate OCR Only`**.
+   - Stores up to **20 authorized plate strings** and camera/recognition calibration in NVS Flash across reboots.
+   - Hosts a Web UI at **`http://192.168.4.102`** (live quad/bounding-box preview, `QR CODE` / `BARCODE` / `OCR` source indicator, Add/Delete/Use Last Read plate manager, test buttons, mode/polarity/fuzzy/flash settings).
+   - **Authorized Plate / QR / Barcode** (`2` consecutive valid reads) → ESP-NOW opens the **2-Servo Car Gate (`GPIO18` & `GPIO19`)**.
+   - **Unknown Plate / QR / Barcode** (`2` consecutive valid reads, `4 s` cooldown) → ESP-NOW triggers the **4 s Siren Buzzer (`GPIO25`)**.
 
 ---
 
@@ -77,10 +80,10 @@ A multi-node ESP32 smart home safety and biometric/vehicle access-control system
 
 ## Build & Upload (PlatformIO)
 
-[`platformio.ini`](platformio.ini) defines three environments:
+[`platformio.ini`](platformio.ini) defines four environments:
 
 ```bash
-# Build all three firmwares at once
+# Build all firmwares at once
 pio run
 
 # 1) Flash Main ESP32 Hub (esp32dev)
@@ -89,8 +92,11 @@ pio run -e esp32dev -t upload
 # 2) Flash Camera 1 (Face Recognition HW-297) — IO0 grounded during upload
 pio run -e cam_face -t upload
 
-# 3) Flash Camera 2 (License Plate OCR HW-297) — IO0 grounded during upload
+# 3) Flash Camera 2 (Auto: QR / Barcode + Plate OCR) — IO0 grounded during upload
 pio run -e cam_plate -t upload
+
+# 3b) Optional: Flash Camera 2 defaulting directly to QR Code / Barcode Only mode
+pio run -e cam_plate_qr -t upload
 ```
 
 Monitor any board at **`115200` baud**:
@@ -107,7 +113,7 @@ pio device monitor -b 115200
 3. Connect your phone or laptop to Wi-Fi **`SmartHome-Net`** (password: **`smarthome123`**):
    - **Main Hub Status**: `http://192.168.4.1`
    - **Camera 1 (Face Recognition)**: `http://192.168.4.101` — Look at the camera (~40–80 cm), enter a name, click **Enroll Next Face** (saved to Flash partition `fr`).
-   - **Camera 2 (Car Plate OCR)**: `http://192.168.4.102` — Add plate strings manually or hold a high-contrast plate in view (~25–55 cm) and click **Use Last Read** → **Add Plate** (saved to NVS).
+   - **Camera 2 (Car Plate / QR / Barcode)**: `http://192.168.4.102` — Add plate strings manually, or hold a license plate (`~25–55 cm`), QR code (`~15–55 cm`, e.g. containing `ABC1234` or `PLATE:ABC1234`), or Code 128 / Code 39 barcode (`~15–35 cm`, filling most of preview width) in view and click **Use Last Read** → **Add Plate** (saved to NVS).
 
 > **Standalone Bench Setup (Hub Powered Off)**: If a camera cannot find `SmartHome-Net` within `12 s` of boot, it starts a temporary setup hotspot (`SmartHome-FaceCam` at `http://192.168.11.1`, or `SmartHome-PlateCam` at `http://192.168.12.1`, password `smarthome123`) while continuing to scan for the Hub in the background.
 
@@ -117,7 +123,7 @@ pio device monitor -b 115200
 
 ```text
 .
-├── platformio.ini                 # Multi-env build (esp32dev + cam_face + cam_plate)
+├── platformio.ini                 # Multi-env build (esp32dev + cam_face + cam_plate + cam_plate_qr)
 ├── partitions_cam_face.csv        # 4 MB partition table with "fr" face database partition
 ├── include/
 │   └── smart_home_protocol.h      # Shared Wi-Fi SoftAP & ESP-NOW CamEventPacket definitions
@@ -129,8 +135,11 @@ pio device monitor -b 115200
 │   ├── cam_face/
 │   │   └── main.cpp               # Camera 1: ESP-DL MSR01/MNP01 + MobileFaceNet S8 + Flash DB
 │   └── cam_plate/
+│       ├── quirc/                 # PSRAM-backed MIT/ISC QR decoder core
+│       ├── plate_code.h           # Camera 2: QR Code (quirc) + Code 128 / Code 39 decoder
+│       ├── plate_code.cpp
 │       ├── plate_ocr.h            # Camera 2: On-device ALPR localization, CCL & 16x16 NCC OCR
 │       ├── plate_ocr.cpp
-│       └── main.cpp               # Camera 2 capture loop, NVS plate DB, Web UI & ESP-NOW
+│       └── main.cpp               # Camera 2 capture loop, mode switcher, NVS plate DB & Web UI
 └── README.md                      # Project documentation
 ```

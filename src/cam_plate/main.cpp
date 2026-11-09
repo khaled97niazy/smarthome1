@@ -1,7 +1,8 @@
-// Smart Home Camera 2 — Standalone On-Device Car License Plate Recognition (HW-297 / ESP32-CAM)
-// Runs 100% locally on the ESP32-CAM (no PC/cloud): edge-energy ROI localization,
-// adaptive Otsu thresholding, 2D connected-component character segmentation, and
-// 16x16 zero-mean normalized cross-correlation OCR. Sends ESP-NOW events to the Hub.
+// Smart Home Camera 2 — On-Device Car License Plate, QR Code & Barcode Recognition (HW-297 / ESP32-CAM)
+// Runs 100% locally on the ESP32-CAM (no PC/cloud):
+//   - QR Code decoder (PSRAM-backed quirc) + 1D Barcode decoder (Code 128 & Code 39)
+//   - Fallback License Plate OCR (edge-energy ROI, Otsu, CCL, 16x16 NCC)
+// Sends ESP-NOW recognized / intruder events to the Main Hub.
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "cam_net.h"
+#include "plate_code.h"
 #include "plate_ocr.h"
 #include "smart_home_protocol.h"
 
@@ -53,7 +55,18 @@ constexpr size_t MAX_PLATES = 20;
 constexpr unsigned long RECOGNIZED_COOLDOWN_MS = 3500;
 constexpr unsigned long UNKNOWN_COOLDOWN_MS = 4000;
 
+enum PlateRecognitionMode : uint8_t {
+  PLATE_MODE_AUTO = 0,      // Try QR / Barcode first, fallback to License Plate OCR
+  PLATE_MODE_CODE_ONLY = 1, // QR Code & Barcode (Code 128 / Code 39) only
+  PLATE_MODE_OCR_ONLY = 2,  // License Plate OCR only
+};
+
+#ifndef PLATE_DEFAULT_MODE
+#define PLATE_DEFAULT_MODE PLATE_MODE_AUTO
+#endif
+
 struct PlateConfig {
+  uint8_t mode = PLATE_DEFAULT_MODE;
   int minConf = 55;
   int confirmReads = 2;
   uint8_t polarity = PLATE_POLARITY_AUTO;
@@ -67,10 +80,12 @@ struct PlateConfig {
 struct PlateStatusSnapshot {
   bool cameraReady = false;
   bool ocrReady = false;
+  bool codeReady = false;
   bool plateLocalized = false;
   bool validRead = false;
   bool matched = false;
   char lastResult[24] = "NO PLATE";
+  char lastSource[16] = "---";
   char lastReadText[16] = "---";
   char lastMatchedPlate[16] = "---";
   int lastConf = 0;
@@ -106,6 +121,11 @@ void setFlashLed(uint8_t duty) {
 
 void loadFromNvs(std::vector<String> &plates, PlateConfig &cfg) {
   prefs.begin("platecfg", true);
+  uint8_t defMode = (PLATE_DEFAULT_MODE <= PLATE_MODE_OCR_ONLY)
+                        ? static_cast<uint8_t>(PLATE_DEFAULT_MODE)
+                        : static_cast<uint8_t>(PLATE_MODE_AUTO);
+  cfg.mode = prefs.getUChar("mode", defMode);
+  if (cfg.mode > PLATE_MODE_OCR_ONLY) cfg.mode = defMode;
   cfg.minConf = constrain(prefs.getInt("minc", 55), 35, 85);
   cfg.confirmReads = constrain(prefs.getInt("confn", 2), 1, 5);
   cfg.polarity = prefs.getUChar("pol", PLATE_POLARITY_AUTO);
@@ -143,6 +163,7 @@ void savePlatesToNvs(const std::vector<String> &plates) {
 
 void saveConfigToNvs(const PlateConfig &cfg) {
   prefs.begin("platecfg", false);
+  prefs.putUChar("mode", cfg.mode);
   prefs.putInt("minc", cfg.minConf);
   prefs.putInt("confn", cfg.confirmReads);
   prefs.putUChar("pol", cfg.polarity);
@@ -252,20 +273,50 @@ void plateWorkerTask(void * /*param*/) {
     }
 
     unsigned long tStart = millis();
+    PlateCodeResult codeRes = {};
     PlateOcrResult ocr = {};
-    plateOcrAnalyze(fb->buf,
-                    static_cast<int>(fb->width),
-                    static_cast<int>(fb->height),
-                    static_cast<PlatePolarity>(cfg.polarity),
-                    cfg.minConf,
-                    ocr);
+
+    const bool tryCode = (cfg.mode != PLATE_MODE_OCR_ONLY);
+    const bool tryOcr = (cfg.mode != PLATE_MODE_CODE_ONLY);
+
+    if (tryCode) {
+      plateCodeAnalyze(fb->buf,
+                       static_cast<int>(fb->width),
+                       static_cast<int>(fb->height),
+                       true,
+                       true,
+                       codeRes);
+    }
+    if (!codeRes.validRead && tryOcr) {
+      plateOcrAnalyze(fb->buf,
+                      static_cast<int>(fb->width),
+                      static_cast<int>(fb->height),
+                      static_cast<PlatePolarity>(cfg.polarity),
+                      cfg.minConf,
+                      ocr);
+    }
     unsigned long elapsedMs = millis() - tStart;
+
+    const bool usedCode = codeRes.validRead;
+    const bool localized = usedCode || ocr.plateLocalized || codeRes.detected;
+    const bool validRead = usedCode || ocr.validRead;
+    const char *readText = usedCode ? codeRes.text : ocr.text;
+    const uint8_t readConf = usedCode ? codeRes.confidence : ocr.avgConfidence;
+    const int charCount = usedCode ? static_cast<int>(strlen(codeRes.text))
+                                   : static_cast<int>(ocr.charCount);
+    const char *srcLabel = "---";
+    if (usedCode || (codeRes.detected && !ocr.plateLocalized)) {
+      srcLabel = plateSymbologyName(codeRes.symbology);
+    } else if (ocr.validRead || ocr.plateLocalized) {
+      srcLabel = "OCR";
+    }
 
     int matchedIdx = -1;
     String matchedStr = "---";
-    if (ocr.validRead) {
+    if (validRead) {
+      const bool allowFuzzy = (!usedCode) && cfg.allowConfusable;
       for (size_t i = 0; i < authorized.size(); ++i) {
-        if (plateMatchesAuthorized(ocr.text, authorized[i].c_str(), cfg.allowConfusable)) {
+        if (plateMatchesAuthorized(readText, authorized[i].c_str(), allowFuzzy)) {
           matchedIdx = static_cast<int>(i);
           matchedStr = authorized[i];
           break;
@@ -275,7 +326,7 @@ void plateWorkerTask(void * /*param*/) {
 
     unsigned long now = millis();
     const char *stateLabel = "NO PLATE";
-    if (ocr.validRead) {
+    if (validRead) {
       missFrames = 0;
       if (matchedIdx >= 0) {
         stateLabel = "AUTHORIZED";
@@ -287,10 +338,10 @@ void plateWorkerTask(void * /*param*/) {
           lastRecognizedSentMs = now;
           camNetSendEvent(SmartHomeNet::CAM_EVENT_RECOGNIZED,
                           static_cast<int16_t>(matchedIdx),
-                          ocr.avgConfidence,
+                          readConf,
                           matchedStr.c_str());
-          Serial.printf("[PLATE] AUTHORIZED read=\"%s\" matched=\"%s\" conf=%u%%\n",
-                        ocr.text, matchedStr.c_str(), ocr.avgConfidence);
+          Serial.printf("[PLATE/%s] AUTHORIZED read=\"%s\" matched=\"%s\" conf=%u%%\n",
+                        srcLabel, readText, matchedStr.c_str(), readConf);
         }
       } else {
         stateLabel = "UNKNOWN";
@@ -303,46 +354,55 @@ void plateWorkerTask(void * /*param*/) {
           lastUnknownSentMs = now;
           camNetSendEvent(SmartHomeNet::CAM_EVENT_UNKNOWN,
                           -1,
-                          ocr.avgConfidence,
-                          ocr.text);
-          Serial.printf("[PLATE] UNKNOWN INTRUDER read=\"%s\" conf=%u%%\n",
-                        ocr.text, ocr.avgConfidence);
+                          readConf,
+                          readText);
+          Serial.printf("[PLATE/%s] UNKNOWN INTRUDER read=\"%s\" conf=%u%%\n",
+                        srcLabel, readText, readConf);
         }
       }
     } else {
       setStatusLed(false);
-      if (ocr.plateLocalized) {
+      if (localized) {
         stateLabel = "CANDIDATE";
       }
-      if (!ocr.plateLocalized || ++missFrames >= 2) {
+      if (!localized || ++missFrames >= 2) {
         recognizedStreak = 0;
         unknownStreak = 0;
       }
     }
 
-    plateDrawOverlayGray(fb->buf,
-                         static_cast<int>(fb->width),
-                         static_cast<int>(fb->height),
-                         ocr,
-                         matchedIdx >= 0);
+    if (usedCode || (codeRes.detected && !ocr.plateLocalized)) {
+      plateCodeDrawOverlayGray(fb->buf,
+                               static_cast<int>(fb->width),
+                               static_cast<int>(fb->height),
+                               codeRes,
+                               matchedIdx >= 0);
+    } else {
+      plateDrawOverlayGray(fb->buf,
+                           static_cast<int>(fb->width),
+                           static_cast<int>(fb->height),
+                           ocr,
+                           matchedIdx >= 0);
+    }
     updatePreviewJpeg(fb);
     esp_camera_fb_return(fb);
 
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-      g_status.plateLocalized = ocr.plateLocalized;
-      g_status.validRead = ocr.validRead;
+      g_status.plateLocalized = localized;
+      g_status.validRead = validRead;
       g_status.matched = (matchedIdx >= 0);
-      g_status.lastConf = ocr.avgConfidence;
-      g_status.lastCharCount = ocr.charCount;
+      g_status.lastConf = readConf;
+      g_status.lastCharCount = charCount;
       g_status.processMs = static_cast<uint32_t>(elapsedMs);
       g_status.frameCount++;
-      strncpy(g_status.lastResult, stateLabel, sizeof(g_status.lastResult) - 1);
-      if (ocr.charCount > 0) {
-        strncpy(g_status.lastReadText, ocr.text, sizeof(g_status.lastReadText) - 1);
+      snprintf(g_status.lastResult, sizeof(g_status.lastResult), "%s", stateLabel);
+      snprintf(g_status.lastSource, sizeof(g_status.lastSource), "%s", srcLabel);
+      if (charCount > 0 && readText[0] != '\0') {
+        snprintf(g_status.lastReadText, sizeof(g_status.lastReadText), "%s", readText);
       } else {
-        strncpy(g_status.lastReadText, "---", sizeof(g_status.lastReadText) - 1);
+        snprintf(g_status.lastReadText, sizeof(g_status.lastReadText), "%s", "---");
       }
-      strncpy(g_status.lastMatchedPlate, matchedStr.c_str(), sizeof(g_status.lastMatchedPlate) - 1);
+      snprintf(g_status.lastMatchedPlate, sizeof(g_status.lastMatchedPlate), "%s", matchedStr.c_str());
       xSemaphoreGive(stateMutex);
     }
 
@@ -371,7 +431,7 @@ void handleRoot() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Camera 2 — Car Plate OCR</title>
+<title>Camera 2 — Plate, QR &amp; Barcode</title>
 <style>
   body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:16px}
   .wrap{max-width:940px;margin:0 auto}
@@ -395,12 +455,13 @@ void handleRoot() {
 </head>
 <body>
 <div class="wrap">
-  <h1>Camera 2 — Standalone Car Plate Recognition (192.168.4.102)</h1>
+  <h1>Camera 2 — Plate OCR, QR &amp; Barcode Recognition (192.168.4.102)</h1>
   <div class="grid">
     <div class="card">
       <img id="cam" src="/preview.jpg" alt="Plate Camera Preview">
-      <div class="row"><span>OCR State</span><span id="res" class="badge off">---</span></div>
-      <div class="row"><span>Detected Text</span><code id="txt">---</code></div>
+      <div class="row"><span>Recognition State</span><span id="res" class="badge off">---</span></div>
+      <div class="row"><span>Detection Source</span><span id="src" class="badge off">---</span></div>
+      <div class="row"><span>Detected Plate</span><code id="txt">---</code></div>
       <div class="row"><span>Confidence / Chars</span><span id="conf">---</span></div>
       <div class="row"><span>Matched Plate</span><span id="match">---</span></div>
       <div class="row"><span>Hub Wireless Link</span><span id="hub" class="badge off">---</span></div>
@@ -412,7 +473,7 @@ void handleRoot() {
     </div>
     <div class="card">
       <strong>Authorized Car Plates (Saved in Flash NVS)</strong>
-      <p style="font-size:.84rem;color:#94a3b8;margin:4px 0 8px">Alphanumeric uppercase (A–Z, 0–9). Fill preview evenly with high contrast (~25–55 cm for model plates).</p>
+      <p style="font-size:.84rem;color:#94a3b8;margin:4px 0 8px">Alphanumeric uppercase (A–Z, 0–9). Works with physical license plates, QR codes, or Code 128 / Code 39 barcodes carrying the plate number.</p>
       <div class="formrow">
         <input id="pinput" type="text" maxlength="12" placeholder="Plate (e.g. ABC1234)" style="text-transform:uppercase;width:150px">
         <button onclick="addPlate()">Add Plate</button>
@@ -426,7 +487,14 @@ void handleRoot() {
       <table><thead><tr><th>#</th><th>Plate</th><th>Action</th></tr></thead><tbody id="plist"></tbody></table>
 
       <hr style="border-color:#334155;margin:12px 0">
-      <strong>OCR &amp; Camera Calibration</strong>
+      <strong>Recognition &amp; Camera Calibration</strong>
+      <div class="row"><span>Recognition Mode</span>
+        <select id="mode">
+          <option value="0">Auto (QR / Barcode &rarr; OCR)</option>
+          <option value="1">QR Code / Barcode Only</option>
+          <option value="2">Plate OCR Only</option>
+        </select>
+      </div>
       <div class="row"><span>Intruder Siren Armed</span><input id="armed" type="checkbox"></div>
       <div class="row"><span>Min OCR Confidence (%)</span><input id="minc" type="number" min="35" max="85" style="width:78px"></div>
       <div class="row"><span>Confirm Frames (1–5)</span><input id="confn" type="number" min="1" max="5" style="width:78px"></div>
@@ -461,6 +529,9 @@ async function refreshStatus(){
     const resEl = document.getElementById('res');
     resEl.textContent = d.lastResult;
     resEl.className = 'badge ' + (d.lastResult==='AUTHORIZED'?'ok':(d.lastResult==='UNKNOWN'?'bad':(d.lastResult==='CANDIDATE'?'warn':'off')));
+    const srcEl = document.getElementById('src');
+    srcEl.textContent = d.lastSource || '---';
+    srcEl.className = 'badge ' + (d.lastSource==='OCR'?'warn':(d.lastSource && d.lastSource!=='---'?'ok':'off'));
     document.getElementById('txt').textContent = d.lastReadText;
     if(d.lastReadText && d.lastReadText !== '---') lastReadCache = d.lastReadText;
     document.getElementById('conf').textContent = d.lastConf + '% (' + d.lastCharCount + ' chars)';
@@ -481,6 +552,7 @@ async function refreshStatus(){
 
     if(!cfgLoaded){
       cfgLoaded = true;
+      document.getElementById('mode').value = d.cfg.mode;
       document.getElementById('armed').checked = d.cfg.armed;
       document.getElementById('minc').value = d.cfg.minConf;
       document.getElementById('confn').value = d.cfg.confirmReads;
@@ -506,6 +578,7 @@ async function delPlate(p){ await fetch('/api/delete?plate=' + encodeURIComponen
 async function clearPlates(){ if(confirm('Delete ALL saved plates?')){ await fetch('/api/clear', {method:'POST'}); refreshStatus(); } }
 async function saveCfg(){
   const q = new URLSearchParams({
+    mode: document.getElementById('mode').value,
     armed: document.getElementById('armed').checked ? 1 : 0,
     minc: document.getElementById('minc').value,
     confn: document.getElementById('confn').value,
@@ -558,11 +631,13 @@ void handleStatus() {
   String json = "{";
   json += "\"cameraReady\":" + String(snap.cameraReady ? "true" : "false") + ",";
   json += "\"ocrReady\":" + String(snap.ocrReady ? "true" : "false") + ",";
+  json += "\"codeReady\":" + String(snap.codeReady ? "true" : "false") + ",";
   json += "\"hubConnected\":" + String(camNetHubConnected() ? "true" : "false") + ",";
   json += "\"ip\":\"" + camNetIpString() + "\",";
   json += "\"plateLocalized\":" + String(snap.plateLocalized ? "true" : "false") + ",";
   json += "\"validRead\":" + String(snap.validRead ? "true" : "false") + ",";
   json += "\"lastResult\":\"" + jsonEscape(snap.lastResult) + "\",";
+  json += "\"lastSource\":\"" + jsonEscape(snap.lastSource) + "\",";
   json += "\"lastReadText\":\"" + jsonEscape(snap.lastReadText) + "\",";
   json += "\"lastMatchedPlate\":\"" + jsonEscape(snap.lastMatchedPlate) + "\",";
   json += "\"lastConf\":" + String(snap.lastConf) + ",";
@@ -575,6 +650,7 @@ void handleStatus() {
     json += "\"" + jsonEscape(platesCopy[i].c_str()) + "\"";
   }
   json += "],\"cfg\":{";
+  json += "\"mode\":" + String(cfgCopy.mode) + ",";
   json += "\"armed\":" + String(cfgCopy.armed ? "true" : "false") + ",";
   json += "\"minConf\":" + String(cfgCopy.minConf) + ",";
   json += "\"confirmReads\":" + String(cfgCopy.confirmReads) + ",";
@@ -659,6 +735,10 @@ void handleConfig() {
   PlateConfig next;
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     next = g_cfg;
+    if (server.hasArg("mode")) {
+      int m = server.arg("mode").toInt();
+      next.mode = (m >= 0 && m <= 2) ? static_cast<uint8_t>(m) : PLATE_MODE_AUTO;
+    }
     if (server.hasArg("armed")) next.armed = (server.arg("armed").toInt() != 0);
     if (server.hasArg("minc")) next.minConf = constrain(server.arg("minc").toInt(), 35, 85);
     if (server.hasArg("confn")) next.confirmReads = constrain(server.arg("confn").toInt(), 1, 5);
@@ -697,24 +777,28 @@ void setup() {
 
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== Smart Home Camera 2: Car Plate OCR (HW-297) ===");
+  Serial.println("\n=== Smart Home Camera 2: Plate OCR + QR/Barcode (HW-297) ===");
 
   stateMutex = xSemaphoreCreateMutex();
   previewMutex = xSemaphoreCreateMutex();
 
   loadFromNvs(g_plates, g_cfg);
   bool ocrOk = plateOcrInit();
+  bool codeOk = plateCodeInit();
   bool camOk = initCamera(g_cfg);
 
   if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
     g_status.cameraReady = camOk;
     g_status.ocrReady = ocrOk;
+    g_status.codeReady = codeOk;
     xSemaphoreGive(stateMutex);
   }
 
-  Serial.printf("Plate OCR init: camOk=%s ocrOk=%s savedPlates=%u\n",
+  Serial.printf("Plate Cam init: camOk=%s ocrOk=%s codeOk=%s mode=%u savedPlates=%u\n",
                 camOk ? "YES" : "NO",
                 ocrOk ? "YES" : "NO",
+                codeOk ? "YES" : "NO",
+                static_cast<unsigned>(g_cfg.mode),
                 static_cast<unsigned>(g_plates.size()));
 
   camNetInit(SmartHomeNet::CAM_SOURCE_PLATE);
@@ -731,10 +815,10 @@ void setup() {
 
   vTaskPrioritySet(nullptr, 2);
 
-  if (camOk && ocrOk) {
+  if (camOk && (ocrOk || codeOk)) {
     xTaskCreatePinnedToCore(plateWorkerTask,
                             "plate_worker",
-                            12288,
+                            16384,
                             nullptr,
                             1,
                             nullptr,
