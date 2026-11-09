@@ -7,9 +7,9 @@ A multi-node ESP32 smart home safety and biometric/vehicle access-control system
 ## System Architecture
 
 1. **Main Hub (`[env:esp32dev]`, [`src/main.cpp`](src/main.cpp))**
-   - **Safety Sensors**: Analog IR Flame (`GPIO34`), MQ-2 Smoke/Gas (`GPIO35`), PIR Motion (`GPIO27`) → sweeping **Siren Buzzer (`GPIO25`)**.
-   - **Car Gate**: HC-SR04 Ultrasonic (`TRIG=GPIO32`, `ECHO=GPIO33`) + **2× Gate Servos (`GPIO18`, `GPIO19`)**, `0° ↔ 180°` smooth non-blocking PWM ramp. Opens for ultrasonic obstacle detection **or** a recognized car license plate from Camera 2.
-   - **3rd Face Door Servo (`GPIO26`)**: `0° ↔ 180°` smooth non-blocking PWM ramp, opens for **`3 seconds`** when Camera 1 recognizes an enrolled face.
+   - **Safety Sensors**: Analog IR Flame (`GPIO34`), MQ-2 Smoke/Gas (`GPIO35`), PIR Motion (`GPIO27`), and HC-SR04 Ultrasonic (`TRIG=GPIO32`, `ECHO=GPIO33`, `<= 25.0 cm`) → sweeping **Siren Buzzer (`GPIO25`)**.
+   - **Car Gate Servos (`GPIO18`, `GPIO19`)**: `0° ↔ 180°` smooth non-blocking PWM ramp, opened exclusively (`5 seconds`) when Camera 2 recognizes an authorized car license plate.
+   - **3rd Face Door Servo (`GPIO26`)**: `0° ↔ 180°` smooth non-blocking PWM ramp, opened exclusively (`3 seconds`) when Camera 1 recognizes an enrolled face.
    - **Intruder Siren Pulse**: Triggers a **`4-second`** siren burst (`GPIO25`) whenever either camera reports an unrecognized face or unrecognized license plate.
    - **Wireless Hub & Dashboard**: Hosts Wi-Fi SoftAP **`SmartHome-Net`** (password `smarthome123`, channel `1`, IP `http://192.168.4.1`) and an ESP-NOW receiver.
 
@@ -54,11 +54,11 @@ A multi-node ESP32 smart home safety and biometric/vehicle access-control system
 | **Flame Sensor** | `AO` | `GPIO34` | Analog Input (`ADC1`) | Triggers when `<= 500` |
 | **MQ-2 Smoke Sensor** | `AO` | `GPIO35` | Analog Input (`ADC1`) | Warm-up `30–60 s`; triggers when `>= 2000` |
 | **PIR Motion Sensor** | `OUT` | `GPIO27` | `INPUT_PULLDOWN` | Active `HIGH` (`3.3 V` logic) |
-| **Ultrasonic Sensor** | `TRIG` | `GPIO32` | Digital Output | 10 µs trigger pulse every `60 ms` |
+| **Ultrasonic Sensor** | `TRIG` | `GPIO32` | Digital Output | 10 µs trigger pulse every `60 ms` (`<= 25.0 cm` triggers siren) |
 | **Ultrasonic Sensor** | `ECHO` | `GPIO33` | Digital Input | **Use 5 V → 3.3 V voltage divider** |
 | **Buzzer** | `SIG` / `+` | `GPIO25` | LEDC Tone PWM (8-bit) | `700 Hz ↔ 1800 Hz` alarm siren |
-| **Car Gate Servo 1** | `PWM` | `GPIO18` | `ESP32Servo` 50 Hz (16-bit) | Opens on ultrasonic or recognized car plate |
-| **Car Gate Servo 2** | `PWM` | `GPIO19` | `ESP32Servo` 50 Hz (16-bit) | Opens on ultrasonic or recognized car plate |
+| **Car Gate Servo 1** | `PWM` | `GPIO18` | `ESP32Servo` 50 Hz (16-bit) | Opens (`5 s`) on recognized car plate from Camera 2 |
+| **Car Gate Servo 2** | `PWM` | `GPIO19` | `ESP32Servo` 50 Hz (16-bit) | Opens (`5 s`) on recognized car plate from Camera 2 |
 | **Face Door Servo 3** | `PWM` | `GPIO26` | `ESP32Servo` 50 Hz (16-bit) | Opens (`3 s`) on recognized face from Camera 1 |
 
 ### Flashing the `HW-297` (ESP32-CAM) Boards via USB-TTL

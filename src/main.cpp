@@ -2,7 +2,7 @@
 // 1- Smoke detector (MQ-2 analog sensor -> buzzer alarm)
 // 2- Fire detection (analog flame sensor -> buzzer alarm)
 // 3- Motion detection (PIR sensor -> buzzer alarm)
-// 4- Ultrasonic gate control (HC-SR04 -> 2 servo motors open to 180 deg)
+// 4- Ultrasonic detection (HC-SR04 -> buzzer alarm)
 // 5- Wireless ESP-NOW + SoftAP hub for 2x ESP32-CAM (HW-297) nodes:
 //    - Camera 1 (Face Recognition) -> opens 3rd door servo (GPIO26) or 4s siren
 //    - Camera 2 (Plate OCR)        -> opens 2-servo car gate (GPIO18/19) or 4s siren
@@ -43,14 +43,14 @@ const int FIRE_THRESHOLD = 500;
 // Tune this after observing smoke vs clean-air ADC values.
 const int SMOKE_THRESHOLD = 2000;
 
-// Ultrasonic gate detection settings.
-// Opens the 2-servo gate when an object is detected within GATE_TRIGGER_DISTANCE_CM.
-const float GATE_TRIGGER_DISTANCE_CM = 25.0f;
+// Ultrasonic proximity/movement alarm settings.
+// Sounds the buzzer siren when an object enters within ULTRASONIC_TRIGGER_DISTANCE_CM.
+const float ULTRASONIC_TRIGGER_DISTANCE_CM = 25.0f;
 const unsigned long ULTRASONIC_INTERVAL_MS = 60;      // >= 60ms between HC-SR04 triggers
 const unsigned long ULTRASONIC_TIMEOUT_US = 20000;    // ~3.4m max range timeout (20ms)
-const int GATE_CONFIRM_READS = 2;                     // consecutive detections to filter glitches
-const unsigned long GATE_HOLD_OPEN_MS = 3000;         // hold gate open after ultrasonic clears
-const unsigned long PLATE_GATE_HOLD_OPEN_MS = 5000;   // hold gate open after recognized plate
+const int ULTRASONIC_CONFIRM_READS = 2;               // consecutive detections to filter glitches
+const unsigned long ULTRASONIC_ALARM_HOLD_MS = 3000;  // keep buzzer active after path clears
+const unsigned long PLATE_GATE_HOLD_OPEN_MS = 5000;   // hold 2-servo gate open after recognized plate
 const unsigned long DOOR_HOLD_OPEN_MS = 3000;         // hold 3rd servo open after recognized face
 const unsigned long CAM_ALARM_DURATION_MS = 4000;     // 4s siren pulse for unrecognized face/plate
 const unsigned long CAM_ONLINE_TIMEOUT_MS = 15000;    // heartbeat freshness window
@@ -102,10 +102,11 @@ int targetDoor3Angle = DOOR3_CLOSED_ANGLE;
 unsigned long lastServoStepMs = 0;
 
 unsigned long lastUltrasonicMs = 0;
-unsigned long lastGateDetectionMs = 0;
+unsigned long ultrasonicAlarmUntilMs = 0;
 unsigned long plateGateUntilMs = 0;
-int gateConfirmCount = 0;
+int ultrasonicConfirmCount = 0;
 float lastDistanceCm = -1.0f;
+bool lastUltrasonicDetected = false;
 bool gateOpen = false;
 
 unsigned long doorOpenUntilMs = 0;
@@ -281,37 +282,38 @@ float readUltrasonicCm() {
   return (durationUs * 0.0343f) / 2.0f;
 }
 
-void updateGateAndDoor(unsigned long now) {
+void updateUltrasonicSensor(unsigned long now) {
   if (now - lastUltrasonicMs >= ULTRASONIC_INTERVAL_MS) {
     lastUltrasonicMs = now;
     lastDistanceCm = readUltrasonicCm();
 
-    bool objectNear = (lastDistanceCm > 0.0f && lastDistanceCm <= GATE_TRIGGER_DISTANCE_CM);
+    bool objectNear = (lastDistanceCm > 0.0f && lastDistanceCm <= ULTRASONIC_TRIGGER_DISTANCE_CM);
     if (objectNear) {
-      if (gateConfirmCount < GATE_CONFIRM_READS) {
-        gateConfirmCount++;
+      if (ultrasonicConfirmCount < ULTRASONIC_CONFIRM_READS) {
+        ultrasonicConfirmCount++;
       }
-      if (gateConfirmCount >= GATE_CONFIRM_READS) {
-        lastGateDetectionMs = now;
-        setGateOpen(true);
+      if (ultrasonicConfirmCount >= ULTRASONIC_CONFIRM_READS) {
+        ultrasonicAlarmUntilMs = now + ULTRASONIC_ALARM_HOLD_MS;
       }
     } else {
-      gateConfirmCount = 0;
+      ultrasonicConfirmCount = 0;
     }
   }
 
-  bool ultrasonicHold = (lastGateDetectionMs != 0 && (now - lastGateDetectionMs < GATE_HOLD_OPEN_MS));
-  bool plateHold = false;
-  if (plateGateUntilMs != 0) {
-    if (static_cast<long>(plateGateUntilMs - now) > 0) {
-      plateHold = true;
-    } else {
+  if (ultrasonicAlarmUntilMs != 0 && static_cast<long>(ultrasonicAlarmUntilMs - now) > 0) {
+    lastUltrasonicDetected = true;
+  } else {
+    ultrasonicAlarmUntilMs = 0;
+    lastUltrasonicDetected = false;
+  }
+}
+
+void updateServosControl(unsigned long now) {
+  if (gateOpen) {
+    if (plateGateUntilMs == 0 || static_cast<long>(plateGateUntilMs - now) <= 0) {
       plateGateUntilMs = 0;
+      setGateOpen(false);
     }
-  }
-
-  if (gateOpen && !ultrasonicHold && !plateHold) {
-    setGateOpen(false);
   }
 
   if (doorOpen) {
@@ -468,13 +470,14 @@ void handleRoot() {
       <div class="row"><span>Flame (GPIO34)</span><span id="flame" class="badge off">---</span></div>
       <div class="row"><span>Smoke MQ-2 (GPIO35)</span><span id="smoke" class="badge off">---</span></div>
       <div class="row"><span>PIR Motion (GPIO27)</span><span id="pir" class="badge off">---</span></div>
+      <div class="row"><span>Ultrasonic (GPIO32/33)</span><span id="ultra" class="badge off">---</span></div>
       <div class="row"><span>Siren (GPIO25)</span><span id="siren" class="badge off">---</span></div>
     </div>
     <div class="card">
-      <div class="k">Servos &amp; Ultrasonic Gate</div>
-      <div class="row"><span>Ultrasonic (GPIO32/33)</span><span id="dist">---</span></div>
-      <div class="row"><span>Car Gate Servos (GPIO18/19)</span><span id="gate" class="badge off">---</span></div>
-      <div class="row"><span>Face Door Servo (GPIO26)</span><span id="door" class="badge off">---</span></div>
+      <div class="k">Camera-Controlled Servos</div>
+      <div class="row"><span>Car Gate Servos (Plate Cam)</span><span id="gate" class="badge off">---</span></div>
+      <div class="row"><span>Face Door Servo (Face Cam)</span><span id="door" class="badge off">---</span></div>
+      <div class="row"><span>Ultrasonic Distance</span><span id="dist">---</span></div>
       <div class="row"><span>Wi-Fi AP</span><span>SmartHome-Net (192.168.4.1)</span></div>
     </div>
     <div class="card">
@@ -501,6 +504,7 @@ async function refresh(){
     setBadge('flame', (d.fire?'ALERT ':'OK ')+'('+d.flameAdc+')', d.fire?'bad':'ok');
     setBadge('smoke', (d.smoke?'ALERT ':'OK ')+'('+d.smokeAdc+')', d.smoke?'bad':'ok');
     setBadge('pir', d.pir?'MOTION':'CLEAR', d.pir?'warn':'ok');
+    setBadge('ultra', d.ultra?'ALERT':'CLEAR', d.ultra?'warn':'ok');
     setBadge('siren', d.alarm?(d.camAlarm?'CAM SIREN ':'ALARM ')+d.sirenHz+'Hz':'OFF', d.alarm?'bad':'ok');
     document.getElementById('dist').textContent = d.distCm>=0 ? d.distCm.toFixed(1)+' cm' : '---';
     setBadge('gate', (d.gateOpen?'OPEN':'CLOSED')+' ('+d.servo1+'/' +d.servo2+' deg)', d.gateOpen?'ok':'off');
@@ -532,6 +536,7 @@ void handleApiStatus() {
   json += "\"smokeAdc\":" + String(lastSmokeAdc) + ",";
   json += "\"smoke\":" + String(lastSmokeDetected ? "true" : "false") + ",";
   json += "\"pir\":" + String(lastMotionDetected ? "true" : "false") + ",";
+  json += "\"ultra\":" + String(lastUltrasonicDetected ? "true" : "false") + ",";
   json += "\"camAlarm\":" + String(camAlarmActive ? "true" : "false") + ",";
   json += "\"alarm\":" + String(lastAlarmActive ? "true" : "false") + ",";
   json += "\"sirenHz\":" + String(lastAlarmActive ? sirenHz : 0) + ",";
@@ -627,13 +632,14 @@ void setup() {
   Serial.print(", ECHO GPIO");
   Serial.print(ULTRASONIC_ECHO_PIN);
   Serial.print(" (<= ");
-  Serial.print(GATE_TRIGGER_DISTANCE_CM, 1);
-  Serial.print("cm), Gate servos GPIO");
+  Serial.print(ULTRASONIC_TRIGGER_DISTANCE_CM, 1);
+  Serial.print("cm -> buzzer), Gate servos GPIO");
   Serial.print(GATE_SERVO_1_PIN);
   Serial.print(" & GPIO");
   Serial.print(GATE_SERVO_2_PIN);
-  Serial.print(", Face door servo GPIO");
-  Serial.println(DOOR_SERVO_3_PIN);
+  Serial.print(" (plate cam), Face door servo GPIO");
+  Serial.print(DOOR_SERVO_3_PIN);
+  Serial.println(" (face cam)");
 }
 
 void loop() {
@@ -653,6 +659,8 @@ void loop() {
   lastFireDetected = lastFlameAdc <= FIRE_THRESHOLD;
   lastSmokeDetected = lastSmokeAdc >= SMOKE_THRESHOLD;
 
+  updateUltrasonicSensor(now);
+
   bool camAlarmActive = false;
   if (camAlarmUntilMs != 0) {
     if (static_cast<long>(camAlarmUntilMs - now) > 0) {
@@ -662,7 +670,8 @@ void loop() {
     }
   }
 
-  lastAlarmActive = lastFireDetected || lastSmokeDetected || lastMotionDetected || camAlarmActive;
+  lastAlarmActive = lastFireDetected || lastSmokeDetected || lastMotionDetected ||
+                    lastUltrasonicDetected || camAlarmActive;
 
   if (lastAlarmActive) {
     startSiren();
@@ -671,7 +680,7 @@ void loop() {
     stopSiren();
   }
 
-  updateGateAndDoor(now);
+  updateServosControl(now);
 
   if (now - lastPrintMs >= PRINT_INTERVAL_MS) {
     lastPrintMs = now;
@@ -685,16 +694,18 @@ void loop() {
     Serial.print(lastSmokeDetected ? "YES" : "NO");
     Serial.print(" | PIR motion=");
     Serial.print(lastMotionDetected ? "YES" : "NO");
-    Serial.print(" | CamAlarm=");
-    Serial.print(camAlarmActive ? "YES" : "NO");
-    Serial.print(" | Dist=");
+    Serial.print(" | Ultra=");
+    Serial.print(lastUltrasonicDetected ? "YES(" : "NO(");
     if (lastDistanceCm < 0.0f) {
       Serial.print("---");
     } else {
       Serial.print(lastDistanceCm, 1);
       Serial.print("cm");
     }
-    Serial.print(" gate=");
+    Serial.print(")");
+    Serial.print(" | CamAlarm=");
+    Serial.print(camAlarmActive ? "YES" : "NO");
+    Serial.print(" | gate=");
     if (currentServo1Angle == targetServo1Angle && currentServo2Angle == targetServo2Angle) {
       Serial.print(gateOpen ? "OPEN(" : "CLOSED(");
     } else {
