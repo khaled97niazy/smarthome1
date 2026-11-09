@@ -6,20 +6,26 @@
 
 #include <Arduino.h>
 
-// Fire detection (analog flame sensor) + buzzer alarm
-// Wiring (ESP32 dev board):
-// - Flame sensor AO -> GPIO34 (ADC1, input-only)
-// - Buzzer signal    -> GPIO25 (output; use a passive/piezo buzzer or a
-//                     transistor driver module for best siren volume)
+// ---------------------------------------------------------------------------
+// Sensors
+// ---------------------------------------------------------------------------
+// Flame sensor AO -> GPIO34 (ADC1, input-only)
+// MQ-2 smoke AO   -> GPIO35 (ADC1, input-only)
+// Buzzer signal   -> GPIO25 (passive/piezo buzzer or transistor driver module)
 const int FIRE_SENSOR_PIN = 34;
+const int MQ2_SENSOR_PIN = 35;
 const int BUZZER_PIN = 25;
 
-// Reversed sensor: normal ~4095 (no flame), drops toward 0 when flame detected.
-// Fire is detected when reading is BELOW this threshold.
+// Reversed flame sensor: normal ~4095 (no flame), drops toward 0 when flame detected.
 const int FIRE_THRESHOLD = 500;
 
-// Siren pattern (ESP32 LEDC tone generation, Arduino-ESP32 core 3.x).
-// Works best with a passive buzzer. Active buzzers may only click/beep.
+// MQ-2 smoke threshold. MQ-2 needs warm-up (~30-60s) before readings are stable.
+// Tune this after observing smoke vs clean-air ADC values.
+const int SMOKE_THRESHOLD = 2000;
+
+// ---------------------------------------------------------------------------
+// Siren (ESP32 LEDC tone generation, Arduino-ESP32 core 3.x)
+// ---------------------------------------------------------------------------
 const int SIREN_RESOLUTION_BITS = 8;
 const int SIREN_LOW_HZ = 700;
 const int SIREN_HIGH_HZ = 1800;
@@ -69,23 +75,32 @@ void setup() {
   digitalWrite(BUZZER_PIN, LOW);
 
   pinMode(FIRE_SENSOR_PIN, INPUT);
+  pinMode(MQ2_SENSOR_PIN, INPUT);
 
   Serial.begin(115200);
   delay(200);
-  Serial.println("Fire detection started");
-  Serial.print("Sensor pin GPIO");
+  Serial.println("Smart home detection started");
+  Serial.print("Flame sensor GPIO");
   Serial.print(FIRE_SENSOR_PIN);
-  Serial.print(", buzzer pin GPIO");
+  Serial.print(", smoke MQ-2 GPIO");
+  Serial.print(MQ2_SENSOR_PIN);
+  Serial.print(", buzzer GPIO");
   Serial.print(BUZZER_PIN);
-  Serial.print(", threshold <= ");
-  Serial.println(FIRE_THRESHOLD);
+  Serial.print(", fire threshold <= ");
+  Serial.print(FIRE_THRESHOLD);
+  Serial.print(", smoke threshold >= ");
+  Serial.println(SMOKE_THRESHOLD);
 }
 
 void loop() {
-  int sensorValue = analogRead(FIRE_SENSOR_PIN);
-  bool fireDetected = sensorValue <= FIRE_THRESHOLD;
+  int flameValue = analogRead(FIRE_SENSOR_PIN);
+  int smokeValue = analogRead(MQ2_SENSOR_PIN);
 
-  if (fireDetected) {
+  bool fireDetected = flameValue <= FIRE_THRESHOLD;
+  bool smokeDetected = smokeValue >= SMOKE_THRESHOLD;
+  bool alarm = fireDetected || smokeDetected;
+
+  if (alarm) {
     startSiren();
     updateSiren();
   } else {
@@ -96,11 +111,15 @@ void loop() {
   if (now - lastPrintMs >= PRINT_INTERVAL_MS) {
     lastPrintMs = now;
     Serial.print("Flame ADC=");
-    Serial.print(sensorValue);
+    Serial.print(flameValue);
     Serial.print(" fire=");
     Serial.print(fireDetected ? "YES" : "NO");
+    Serial.print(" | Smoke ADC=");
+    Serial.print(smokeValue);
+    Serial.print(" smoke=");
+    Serial.print(smokeDetected ? "YES" : "NO");
     Serial.print(" sirenHz=");
-    Serial.println(fireDetected ? sirenHz : 0);
+    Serial.println(alarm ? sirenHz : 0);
   }
 
   delay(5);
