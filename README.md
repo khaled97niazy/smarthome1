@@ -59,7 +59,7 @@ A multi-node ESP32 smart home safety and biometric/vehicle access-control system
 | **PIR Motion Sensor** | `OUT` | `GPIO27` | `INPUT_PULLDOWN` | Active `HIGH` (`3.3 V` logic) |
 | **Ultrasonic Sensor** | `TRIG` | `GPIO32` | Digital Output | 10 µs trigger pulse every `60 ms` (`<= 25.0 cm` triggers siren) |
 | **Ultrasonic Sensor** | `ECHO` | `GPIO33` | Digital Input | **Use 5 V → 3.3 V voltage divider** |
-| **Buzzer** | `SIG` / `+` | `GPIO25` | LEDC Tone PWM (8-bit) | `700 Hz ↔ 1800 Hz` alarm siren |
+| **Buzzer** | `SIG` / `+` | `GPIO25` | LEDC Tone PWM (10-bit) | `700 Hz ↔ 1800 Hz` alarm siren |
 | **Car Gate Servo 1** | `PWM` | `GPIO18` | `ESP32Servo` 50 Hz (16-bit) | Opens (`5 s`) on recognized car plate from Camera 2 |
 | **Car Gate Servo 2** | `PWM` | `GPIO19` | `ESP32Servo` 50 Hz (16-bit) | Opens (`5 s`) on recognized car plate from Camera 2 |
 | **Face Door Servo 3** | `PWM` | `GPIO26` | `ESP32Servo` 50 Hz (16-bit) | Opens (`3 s`) on recognized face from Camera 1 |
@@ -126,10 +126,13 @@ pio device monitor -b 115200
 ├── platformio.ini                 # Multi-env build (esp32dev + cam_face + cam_plate + cam_plate_qr)
 ├── partitions_cam_face.csv        # 4 MB partition table with "fr" face database partition
 ├── include/
+│   ├── smart_home_json.h          # Shared JSON string escaping helper
 │   └── smart_home_protocol.h      # Shared Wi-Fi SoftAP & ESP-NOW CamEventPacket definitions
 ├── src/
 │   ├── main.cpp                   # Main Hub firmware (sensors, 3 servos, SoftAP, ESP-NOW, Web UI)
 │   ├── cam_common/
+│   │   ├── cam_hw.h               # Shared HW-297 LED, OV2640 sensor, and JPEG preview helpers
+│   │   ├── cam_hw.cpp
 │   │   ├── cam_net.h              # Shared STA + fallback AP + ESP-NOW sender helpers
 │   │   └── cam_net.cpp
 │   ├── cam_face/

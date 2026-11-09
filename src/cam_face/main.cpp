@@ -8,13 +8,13 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_camera.h>
-#include <esp_heap_caps.h>
 #include <fb_gfx.h>
-#include <img_converters.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <list>
 #include <string>
@@ -25,39 +25,17 @@
 #include "face_recognition_tool.hpp"
 #include "face_recognition_112_v1_s8.hpp"
 
+#include "cam_hw.h"
 #include "cam_net.h"
+#include "smart_home_json.h"
 #include "smart_home_protocol.h"
-
-// AI-Thinker ESP32-CAM (HW-297) Pinout
-#if defined(CAMERA_MODEL_AI_THINKER)
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
-#define FLASH_LED_PIN      4
-#define STATUS_LED_PIN    33
-#else
-#error "CAMERA_MODEL_AI_THINKER must be defined"
-#endif
 
 namespace {
 
-constexpr int FLASH_LEDC_CHANNEL = 2; // Avoid LEDC channel 0 used by camera XCLK
 constexpr unsigned long RECOGNIZED_COOLDOWN_MS = 2500;
 constexpr unsigned long UNKNOWN_COOLDOWN_MS = 4000;
 constexpr unsigned long ENROLL_TIMEOUT_MS = 12000;
+constexpr size_t MAX_PENDING_DELETES = 16;
 
 struct EnrolledEntry {
   int id;
@@ -79,7 +57,6 @@ struct FaceStatusSnapshot {
   bool flashOk = false;
   bool faceDetected = false;
   bool enrollPending = false;
-  char enrollTargetName[24] = "";
   char enrollMessage[64] = "Idle";
   char lastResult[24] = "NONE";
   char lastMatchName[24] = "---";
@@ -96,30 +73,16 @@ Preferences prefs;
 WebServer server(80);
 
 SemaphoreHandle_t stateMutex = nullptr;
-SemaphoreHandle_t previewMutex = nullptr;
 
 FaceStatusSnapshot g_status;
 FaceConfig g_pendingCfg;
 bool g_applyCfgPending = false;
 bool g_enrollPending = false;
+uint32_t g_enrollSeq = 0;
 unsigned long g_enrollStartMs = 0;
 char g_enrollName[24] = "User";
-bool g_deletePending = false;
-int g_deleteId = -1;
+std::vector<int> g_pendingDeleteIds;
 bool g_clearPending = false;
-
-uint8_t *g_previewJpg = nullptr;
-size_t g_previewJpgLen = 0;
-size_t g_previewJpgCap = 0;
-
-void setStatusLed(bool on) {
-  // AI-Thinker red status LED on GPIO33 is active-LOW
-  digitalWrite(STATUS_LED_PIN, on ? LOW : HIGH);
-}
-
-void setFlashLed(uint8_t duty) {
-  ledcWrite(FLASH_LEDC_CHANNEL, duty);
-}
 
 uint16_t packRgb565Color(uint32_t bgr888) {
   return static_cast<uint16_t>(((bgr888 >> 16) & 0x001F) |
@@ -172,35 +135,8 @@ void drawFaceOverlay(camera_fb_t *fb,
   }
 }
 
-void updatePreviewJpeg(camera_fb_t *fb) {
-  uint8_t *jpgBuf = nullptr;
-  size_t jpgLen = 0;
-  if (!fmt2jpg(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 80, &jpgBuf, &jpgLen)) {
-    return;
-  }
-
-  if (previewMutex && xSemaphoreTake(previewMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    if (jpgLen > g_previewJpgCap) {
-      uint8_t *newBuf = static_cast<uint8_t *>(ps_realloc(g_previewJpg, jpgLen));
-      if (!newBuf) {
-        newBuf = static_cast<uint8_t *>(realloc(g_previewJpg, jpgLen));
-      }
-      if (newBuf) {
-        g_previewJpg = newBuf;
-        g_previewJpgCap = jpgLen;
-      }
-    }
-    if (g_previewJpg && jpgLen <= g_previewJpgCap) {
-      memcpy(g_previewJpg, jpgBuf, jpgLen);
-      g_previewJpgLen = jpgLen;
-    }
-    xSemaphoreGive(previewMutex);
-  }
-  free(jpgBuf);
-}
-
 void loadConfigFromNvs(FaceConfig &cfg) {
-  prefs.begin("facecfg", true);
+  if (!prefs.begin("facecfg", true)) return;
   cfg.thresh = prefs.getFloat("thresh", 0.55f);
   cfg.unknownConfirm = prefs.getInt("uconf", 2);
   cfg.armed = prefs.getBool("armed", true);
@@ -214,7 +150,7 @@ void loadConfigFromNvs(FaceConfig &cfg) {
 }
 
 void saveConfigToNvs(const FaceConfig &cfg) {
-  prefs.begin("facecfg", false);
+  if (!prefs.begin("facecfg", false)) return;
   prefs.putFloat("thresh", cfg.thresh);
   prefs.putInt("uconf", cfg.unknownConfirm);
   prefs.putBool("armed", cfg.armed);
@@ -222,53 +158,6 @@ void saveConfigToNvs(const FaceConfig &cfg) {
   prefs.putBool("hmir", cfg.hmirror);
   prefs.putBool("vflip", cfg.vflip);
   prefs.end();
-}
-
-void applySensorSettings(const FaceConfig &cfg) {
-  sensor_t *s = esp_camera_sensor_get();
-  if (s) {
-    s->set_hmirror(s, cfg.hmirror ? 1 : 0);
-    s->set_vflip(s, cfg.vflip ? 1 : 0);
-  }
-  setFlashLed(cfg.flashDuty);
-}
-
-bool initCamera(const FaceConfig &cfg) {
-  camera_config_t config = {};
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_RGB565;
-  config.frame_size = FRAMESIZE_240X240;
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
-
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("ERROR: esp_camera_init failed (0x%x)\n", err);
-    return false;
-  }
-
-  applySensorSettings(cfg);
-  return true;
 }
 
 void syncEnrolledSnapshot(FaceRecognition112V1S8 &recognizer, FaceStatusSnapshot &snap) {
@@ -352,22 +241,21 @@ void faceWorkerTask(void * /*param*/) {
 
   while (true) {
     // Service pending commands without holding recognizer across HTTP calls
-    bool doDelete = false;
-    int deleteId = -1;
+    std::vector<int> deleteIds;
     bool doClear = false;
     bool doApplyCfg = false;
     bool enrollActive = false;
+    uint32_t enrollSeq = 0;
     char enrollTarget[24] = "";
 
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
       if (g_clearPending) {
         doClear = true;
         g_clearPending = false;
+        g_pendingDeleteIds.clear();
       }
-      if (g_deletePending) {
-        doDelete = true;
-        deleteId = g_deleteId;
-        g_deletePending = false;
+      if (!g_pendingDeleteIds.empty()) {
+        deleteIds.swap(g_pendingDeleteIds);
       }
       if (g_applyCfgPending) {
         activeCfg = g_pendingCfg;
@@ -383,7 +271,8 @@ void faceWorkerTask(void * /*param*/) {
                    "Enroll timed out: no face detected");
         } else {
           enrollActive = true;
-          strncpy(enrollTarget, g_enrollName, sizeof(enrollTarget) - 1);
+          enrollSeq = g_enrollSeq;
+          snprintf(enrollTarget, sizeof(enrollTarget), "%s", g_enrollName);
         }
       }
       xSemaphoreGive(stateMutex);
@@ -400,20 +289,28 @@ void faceWorkerTask(void * /*param*/) {
       }
     }
 
-    if (doDelete) {
-      recognizer.delete_id(deleteId, true);
+    if (!deleteIds.empty()) {
+      for (int id : deleteIds) {
+        recognizer.delete_id(id, true);
+        Serial.printf("Deleted face ID #%d from Flash.\n", id);
+      }
       unknownStreak = 0;
-      Serial.printf("Deleted face ID #%d from Flash.\n", deleteId);
       if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
         syncEnrolledSnapshot(recognizer, g_status);
-        snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage), "Deleted face ID #%d", deleteId);
+        if (deleteIds.size() == 1) {
+          snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
+                   "Deleted face ID #%d", deleteIds[0]);
+        } else {
+          snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
+                   "Deleted %u faces", static_cast<unsigned>(deleteIds.size()));
+        }
         xSemaphoreGive(stateMutex);
       }
     }
 
     if (doApplyCfg) {
       recognizer.set_thresh(activeCfg.thresh);
-      applySensorSettings(activeCfg);
+      camHwApplySensorSettings(activeCfg.hmirror, activeCfg.vflip, activeCfg.flashDuty);
       saveConfigToNvs(activeCfg);
       Serial.printf("Updated settings: thresh=%.2f armed=%d uconf=%d flash=%u\n",
                     activeCfg.thresh, activeCfg.armed, activeCfg.unknownConfirm, activeCfg.flashDuty);
@@ -498,7 +395,7 @@ void faceWorkerTask(void * /*param*/) {
             strncpy(matchedName, info.name.c_str(), sizeof(matchedName) - 1);
             matchedName[sizeof(matchedName) - 1] = '\0';
           }
-          setStatusLed(true);
+          camHwSetStatusLed(true);
 
           if (now - lastRecognizedSentMs >= RECOGNIZED_COOLDOWN_MS) {
             lastRecognizedSentMs = now;
@@ -527,7 +424,7 @@ void faceWorkerTask(void * /*param*/) {
       }
     } else {
       unknownStreak = 0;
-      setStatusLed(false);
+      camHwSetStatusLed(false);
     }
 
     unsigned long elapsedMs = millis() - tStart;
@@ -538,7 +435,7 @@ void faceWorkerTask(void * /*param*/) {
     if (!results.empty()) {
       drawFaceOverlay(fb, results, overlayState, enrollActive);
     }
-    updatePreviewJpeg(fb);
+    camHwUpdatePreviewJpeg(fb, PIXFORMAT_RGB565, 80);
     esp_camera_fb_return(fb);
 
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -547,10 +444,11 @@ void faceWorkerTask(void * /*param*/) {
       g_status.lastSimilarity = similarity;
       g_status.inferenceMs = static_cast<uint32_t>(elapsedMs);
       g_status.frameCount++;
-      strncpy(g_status.lastResult, resultLabel, sizeof(g_status.lastResult) - 1);
-      strncpy(g_status.lastMatchName, matchedName, sizeof(g_status.lastMatchName) - 1);
+      snprintf(g_status.lastResult, sizeof(g_status.lastResult), "%s", resultLabel);
+      snprintf(g_status.lastMatchName, sizeof(g_status.lastMatchName), "%s", matchedName);
 
-      if (enrollActive) {
+      // Only clear g_enrollPending if no newer /api/enroll arrived while inference ran
+      if (enrollActive && g_enrollSeq == enrollSeq) {
         g_enrollPending = false;
         g_status.enrollPending = false;
         if (enrolledNow) {
@@ -562,27 +460,14 @@ void faceWorkerTask(void * /*param*/) {
           snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
                    "Enroll failed (Flash full or bad alignment)");
         }
+      } else if (enrollActive && enrolledNow) {
+        syncEnrolledSnapshot(recognizer, g_status);
       }
       xSemaphoreGive(stateMutex);
     }
 
     vTaskDelay(pdMS_TO_TICKS(30));
   }
-}
-
-String jsonEscape(const char *s) {
-  String out;
-  if (!s) return out;
-  for (size_t i = 0; s[i] != '\0'; ++i) {
-    char c = s[i];
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += c;
-    } else if (static_cast<uint8_t>(c) >= 0x20) {
-      out += c;
-    }
-  }
-  return out;
 }
 
 void handleRoot() {
@@ -656,12 +541,37 @@ void handleRoot() {
 </div>
 <script>
 let cfgLoaded = false;
+let lastListSig = '';
 function refreshImg(){
   const img = document.getElementById('cam');
   const nxt = new Image();
   nxt.onload = ()=>{ img.src = nxt.src; setTimeout(refreshImg, 450); };
   nxt.onerror = ()=>{ setTimeout(refreshImg, 1200); };
   nxt.src = '/preview.jpg?t=' + Date.now();
+}
+function renderEnrolledTable(list){
+  const sig = list.map(i=>i.id+':'+i.name).join('|');
+  if(sig === lastListSig) return;
+  lastListSig = sig;
+  const tb = document.getElementById('elist');
+  tb.textContent = '';
+  list.forEach(item=>{
+    const tr = document.createElement('tr');
+    const tdId = document.createElement('td');
+    tdId.textContent = '#' + item.id;
+    const tdName = document.createElement('td');
+    tdName.textContent = item.name;
+    const tdAct = document.createElement('td');
+    const btn = document.createElement('button');
+    btn.className = 'red';
+    btn.textContent = 'Delete';
+    btn.addEventListener('click', ()=>delFace(item.id));
+    tdAct.appendChild(btn);
+    tr.appendChild(tdId);
+    tr.appendChild(tdName);
+    tr.appendChild(tdAct);
+    tb.appendChild(tr);
+  });
 }
 async function refreshStatus(){
   try{
@@ -677,14 +587,7 @@ async function refreshStatus(){
     document.getElementById('perf').textContent = d.inferenceMs + ' ms | Flash=' + (d.flashOk?'OK':'ERR');
     document.getElementById('emsg').textContent = d.enrollMessage;
     document.getElementById('ecnt').textContent = d.enrolledCount;
-
-    const tb = document.getElementById('elist');
-    tb.innerHTML = '';
-    d.enrolled.forEach(item=>{
-      const tr = document.createElement('tr');
-      tr.innerHTML = '<td>#'+item.id+'</td><td>'+item.name+'</td><td><button class="red" onclick="delFace('+item.id+')">Delete</button></td>';
-      tb.appendChild(tr);
-    });
+    renderEnrolledTable(d.enrolled);
 
     if(!cfgLoaded){
       cfgLoaded = true;
@@ -726,20 +629,7 @@ refreshImg(); refreshStatus(); setInterval(refreshStatus, 1000);
 }
 
 void handlePreview() {
-  if (!previewMutex || xSemaphoreTake(previewMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-    server.send(503, "text/plain", "Preview busy");
-    return;
-  }
-  if (!g_previewJpg || g_previewJpgLen == 0) {
-    xSemaphoreGive(previewMutex);
-    server.send(503, "text/plain", "Preview not ready");
-    return;
-  }
-  server.sendHeader("Cache-Control", "no-store");
-  server.setContentLength(g_previewJpgLen);
-  server.send(200, "image/jpeg", "");
-  server.sendContent(reinterpret_cast<const char *>(g_previewJpg), g_previewJpgLen);
-  xSemaphoreGive(previewMutex);
+  camHwHandlePreviewRequest(server);
 }
 
 void handleStatus() {
@@ -758,9 +648,9 @@ void handleStatus() {
   json += "\"ip\":\"" + camNetIpString() + "\",";
   json += "\"faceDetected\":" + String(snap.faceDetected ? "true" : "false") + ",";
   json += "\"enrollPending\":" + String(snap.enrollPending ? "true" : "false") + ",";
-  json += "\"enrollMessage\":\"" + jsonEscape(snap.enrollMessage) + "\",";
-  json += "\"lastResult\":\"" + jsonEscape(snap.lastResult) + "\",";
-  json += "\"lastMatchName\":\"" + jsonEscape(snap.lastMatchName) + "\",";
+  json += "\"enrollMessage\":\"" + smartHomeJsonEscape(snap.enrollMessage) + "\",";
+  json += "\"lastResult\":\"" + smartHomeJsonEscape(snap.lastResult) + "\",";
+  json += "\"lastMatchName\":\"" + smartHomeJsonEscape(snap.lastMatchName) + "\",";
   json += "\"lastMatchId\":" + String(snap.lastMatchId) + ",";
   json += "\"lastSimilarity\":" + String(snap.lastSimilarity, 3) + ",";
   json += "\"inferenceMs\":" + String(snap.inferenceMs) + ",";
@@ -769,7 +659,8 @@ void handleStatus() {
   json += "\"enrolled\":[";
   for (size_t i = 0; i < snap.enrolled.size(); ++i) {
     if (i > 0) json += ",";
-    json += "{\"id\":" + String(snap.enrolled[i].id) + ",\"name\":\"" + jsonEscape(snap.enrolled[i].name) + "\"}";
+    json += "{\"id\":" + String(snap.enrolled[i].id) +
+            ",\"name\":\"" + smartHomeJsonEscape(snap.enrolled[i].name) + "\"}";
   }
   json += "],\"cfg\":{";
   json += "\"armed\":" + String(snap.cfg.armed ? "true" : "false") + ",";
@@ -788,6 +679,7 @@ void handleEnroll() {
   String rawName = server.hasArg("name") ? server.arg("name") : String("User");
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     sanitizeName(rawName, g_enrollName, sizeof(g_enrollName));
+    g_enrollSeq++;
     g_enrollPending = true;
     g_enrollStartMs = millis();
     g_status.enrollPending = true;
@@ -801,10 +693,20 @@ void handleEnroll() {
 }
 
 void handleDelete() {
-  int id = server.hasArg("id") ? server.arg("id").toInt() : -1;
+  String rawId = server.hasArg("id") ? server.arg("id") : String("");
+  bool isDigits = (rawId.length() > 0);
+  for (size_t i = 0; i < rawId.length(); ++i) {
+    if (!isdigit(static_cast<unsigned char>(rawId[i]))) {
+      isDigits = false;
+      break;
+    }
+  }
+  int id = isDigits ? rawId.toInt() : -1;
   if (id >= 0 && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    g_deleteId = id;
-    g_deletePending = true;
+    if (std::find(g_pendingDeleteIds.begin(), g_pendingDeleteIds.end(), id) == g_pendingDeleteIds.end() &&
+        g_pendingDeleteIds.size() < MAX_PENDING_DELETES) {
+      g_pendingDeleteIds.push_back(id);
+    }
     xSemaphoreGive(stateMutex);
     server.send(200, "application/json", "{\"queued\":true}");
   } else {
@@ -850,23 +752,25 @@ void handleTest() {
 } // namespace
 
 void setup() {
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  setStatusLed(false);
-
-  ledcSetup(FLASH_LEDC_CHANNEL, 5000, 8);
-  ledcAttachPin(FLASH_LED_PIN, FLASH_LEDC_CHANNEL);
-  setFlashLed(0);
+  camHwInitLeds();
 
   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== Smart Home Camera 1: Face Recognition (HW-297) ===");
 
   stateMutex = xSemaphoreCreateMutex();
-  previewMutex = xSemaphoreCreateMutex();
+  camHwInitPreview();
 
   FaceConfig cfg;
   loadConfigFromNvs(cfg);
-  bool camOk = initCamera(cfg);
+  bool camOk = camHwInitCamera(PIXFORMAT_RGB565,
+                               FRAMESIZE_240X240,
+                               12,
+                               cfg.hmirror,
+                               cfg.vflip);
+  if (camOk) {
+    camHwSetFlashLed(cfg.flashDuty);
+  }
   if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
     g_status.cfg = cfg;
     g_status.cameraReady = camOk;

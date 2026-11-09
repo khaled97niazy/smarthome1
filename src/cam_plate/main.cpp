@@ -9,48 +9,22 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_camera.h>
-#include <esp_heap_caps.h>
-#include <img_converters.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
 #include <cstring>
-#include <string>
 #include <vector>
 
+#include "cam_hw.h"
 #include "cam_net.h"
 #include "plate_code.h"
 #include "plate_ocr.h"
+#include "smart_home_json.h"
 #include "smart_home_protocol.h"
-
-// AI-Thinker ESP32-CAM (HW-297) Pinout
-#if defined(CAMERA_MODEL_AI_THINKER)
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
-#define FLASH_LED_PIN      4
-#define STATUS_LED_PIN    33
-#else
-#error "CAMERA_MODEL_AI_THINKER must be defined"
-#endif
 
 namespace {
 
-constexpr int FLASH_LEDC_CHANNEL = 2; // Avoid LEDC channel 0 used by camera XCLK
 constexpr size_t MAX_PLATES = 20;
 constexpr unsigned long RECOGNIZED_COOLDOWN_MS = 3500;
 constexpr unsigned long UNKNOWN_COOLDOWN_MS = 4000;
@@ -92,7 +66,6 @@ struct PlateStatusSnapshot {
   int lastCharCount = 0;
   uint32_t processMs = 0;
   uint32_t frameCount = 0;
-  std::vector<String> plates;
   PlateConfig cfg;
 };
 
@@ -100,27 +73,15 @@ Preferences prefs;
 WebServer server(80);
 
 SemaphoreHandle_t stateMutex = nullptr;
-SemaphoreHandle_t previewMutex = nullptr;
 
 PlateStatusSnapshot g_status;
 std::vector<String> g_plates;
 PlateConfig g_cfg;
-
-uint8_t *g_previewJpg = nullptr;
-size_t g_previewJpgLen = 0;
-size_t g_previewJpgCap = 0;
-
-void setStatusLed(bool on) {
-  // AI-Thinker red status LED on GPIO33 is active-LOW
-  digitalWrite(STATUS_LED_PIN, on ? LOW : HIGH);
-}
-
-void setFlashLed(uint8_t duty) {
-  ledcWrite(FLASH_LEDC_CHANNEL, duty);
-}
+PlateConfig g_pendingCfg;
+bool g_applyCfgPending = false;
 
 void loadFromNvs(std::vector<String> &plates, PlateConfig &cfg) {
-  prefs.begin("platecfg", true);
+  if (!prefs.begin("platecfg", true)) return;
   uint8_t defMode = (PLATE_DEFAULT_MODE <= PLATE_MODE_OCR_ONLY)
                         ? static_cast<uint8_t>(PLATE_DEFAULT_MODE)
                         : static_cast<uint8_t>(PLATE_MODE_AUTO);
@@ -150,7 +111,7 @@ void loadFromNvs(std::vector<String> &plates, PlateConfig &cfg) {
 }
 
 void savePlatesToNvs(const std::vector<String> &plates) {
-  prefs.begin("platecfg", false);
+  if (!prefs.begin("platecfg", false)) return;
   size_t count = min<size_t>(MAX_PLATES, plates.size());
   prefs.putUInt("cnt", static_cast<uint32_t>(count));
   for (size_t i = 0; i < count; ++i) {
@@ -158,11 +119,18 @@ void savePlatesToNvs(const std::vector<String> &plates) {
     snprintf(key, sizeof(key), "p%u", static_cast<unsigned>(i));
     prefs.putString(key, plates[i]);
   }
+  for (size_t i = count; i < MAX_PLATES; ++i) {
+    char key[8];
+    snprintf(key, sizeof(key), "p%u", static_cast<unsigned>(i));
+    if (prefs.isKey(key)) {
+      prefs.remove(key);
+    }
+  }
   prefs.end();
 }
 
 void saveConfigToNvs(const PlateConfig &cfg) {
-  prefs.begin("platecfg", false);
+  if (!prefs.begin("platecfg", false)) return;
   prefs.putUChar("mode", cfg.mode);
   prefs.putInt("minc", cfg.minConf);
   prefs.putInt("confn", cfg.confirmReads);
@@ -175,95 +143,32 @@ void saveConfigToNvs(const PlateConfig &cfg) {
   prefs.end();
 }
 
-void applySensorSettings(const PlateConfig &cfg) {
-  sensor_t *s = esp_camera_sensor_get();
-  if (s) {
-    s->set_hmirror(s, cfg.hmirror ? 1 : 0);
-    s->set_vflip(s, cfg.vflip ? 1 : 0);
-    s->set_contrast(s, 1);
-  }
-  setFlashLed(cfg.flashDuty);
-}
-
-bool initCamera(const PlateConfig &cfg) {
-  camera_config_t config = {};
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_GRAYSCALE;
-  config.frame_size = FRAMESIZE_QVGA; // 320x240 grayscale (76.8 KB)
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
-
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("ERROR: esp_camera_init failed (0x%x)\n", err);
-    return false;
-  }
-
-  applySensorSettings(cfg);
-  return true;
-}
-
-void updatePreviewJpeg(camera_fb_t *fb) {
-  uint8_t *jpgBuf = nullptr;
-  size_t jpgLen = 0;
-  if (!fmt2jpg(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_GRAYSCALE, 80, &jpgBuf, &jpgLen)) {
-    return;
-  }
-
-  if (previewMutex && xSemaphoreTake(previewMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    if (jpgLen > g_previewJpgCap) {
-      uint8_t *newBuf = static_cast<uint8_t *>(ps_realloc(g_previewJpg, jpgLen));
-      if (!newBuf) {
-        newBuf = static_cast<uint8_t *>(realloc(g_previewJpg, jpgLen));
-      }
-      if (newBuf) {
-        g_previewJpg = newBuf;
-        g_previewJpgCap = jpgLen;
-      }
-    }
-    if (g_previewJpg && jpgLen <= g_previewJpgCap) {
-      memcpy(g_previewJpg, jpgBuf, jpgLen);
-      g_previewJpgLen = jpgLen;
-    }
-    xSemaphoreGive(previewMutex);
-  }
-  free(jpgBuf);
-}
-
 void plateWorkerTask(void * /*param*/) {
   int recognizedStreak = 0;
   int unknownStreak = 0;
   int missFrames = 0;
+  char lastStreakText[16] = "";
   unsigned long lastRecognizedSentMs = 0;
   unsigned long lastUnknownSentMs = 0;
 
   while (true) {
     PlateConfig cfg;
+    bool applyCfg = false;
     std::vector<String> authorized;
     if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
+      if (g_applyCfgPending) {
+        g_cfg = g_pendingCfg;
+        g_applyCfgPending = false;
+        applyCfg = true;
+      }
       cfg = g_cfg;
       authorized = g_plates;
       xSemaphoreGive(stateMutex);
+    }
+
+    if (applyCfg) {
+      camHwApplySensorSettings(cfg.hmirror, cfg.vflip, cfg.flashDuty, 1);
+      saveConfigToNvs(cfg);
     }
 
     camera_fb_t *fb = esp_camera_fb_get();
@@ -328,11 +233,18 @@ void plateWorkerTask(void * /*param*/) {
     const char *stateLabel = "NO PLATE";
     if (validRead) {
       missFrames = 0;
+      const char *streakKey = (matchedIdx >= 0) ? matchedStr.c_str() : readText;
+      if (strcmp(streakKey, lastStreakText) != 0) {
+        recognizedStreak = 0;
+        unknownStreak = 0;
+        snprintf(lastStreakText, sizeof(lastStreakText), "%s", streakKey);
+      }
+
       if (matchedIdx >= 0) {
         stateLabel = "AUTHORIZED";
         unknownStreak = 0;
         recognizedStreak++;
-        setStatusLed(true);
+        camHwSetStatusLed(true);
         if (recognizedStreak >= cfg.confirmReads &&
             (now - lastRecognizedSentMs >= RECOGNIZED_COOLDOWN_MS)) {
           lastRecognizedSentMs = now;
@@ -347,7 +259,7 @@ void plateWorkerTask(void * /*param*/) {
         stateLabel = "UNKNOWN";
         recognizedStreak = 0;
         unknownStreak++;
-        setStatusLed(false);
+        camHwSetStatusLed(false);
         if (cfg.armed &&
             unknownStreak >= cfg.confirmReads &&
             (now - lastUnknownSentMs >= UNKNOWN_COOLDOWN_MS)) {
@@ -361,13 +273,14 @@ void plateWorkerTask(void * /*param*/) {
         }
       }
     } else {
-      setStatusLed(false);
+      camHwSetStatusLed(false);
       if (localized) {
         stateLabel = "CANDIDATE";
       }
       if (!localized || ++missFrames >= 2) {
         recognizedStreak = 0;
         unknownStreak = 0;
+        lastStreakText[0] = '\0';
       }
     }
 
@@ -384,7 +297,7 @@ void plateWorkerTask(void * /*param*/) {
                            ocr,
                            matchedIdx >= 0);
     }
-    updatePreviewJpeg(fb);
+    camHwUpdatePreviewJpeg(fb, PIXFORMAT_GRAYSCALE, 80);
     esp_camera_fb_return(fb);
 
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -408,21 +321,6 @@ void plateWorkerTask(void * /*param*/) {
 
     vTaskDelay(pdMS_TO_TICKS(35));
   }
-}
-
-String jsonEscape(const char *s) {
-  String out;
-  if (!s) return out;
-  for (size_t i = 0; s[i] != '\0'; ++i) {
-    char c = s[i];
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += c;
-    } else if (static_cast<uint8_t>(c) >= 0x20) {
-      out += c;
-    }
-  }
-  return out;
 }
 
 void handleRoot() {
@@ -515,12 +413,39 @@ void handleRoot() {
 <script>
 let cfgLoaded = false;
 let lastReadCache = '';
+let lastPlatesSig = '';
 function refreshImg(){
   const img = document.getElementById('cam');
   const nxt = new Image();
   nxt.onload = ()=>{ img.src = nxt.src; setTimeout(refreshImg, 350); };
   nxt.onerror = ()=>{ setTimeout(refreshImg, 1200); };
   nxt.src = '/preview.jpg?t=' + Date.now();
+}
+function renderPlatesTable(list){
+  const sig = list.join('|');
+  if(sig === lastPlatesSig) return;
+  lastPlatesSig = sig;
+  const tb = document.getElementById('plist');
+  tb.textContent = '';
+  list.forEach((p, idx)=>{
+    const tr = document.createElement('tr');
+    const tdIdx = document.createElement('td');
+    tdIdx.textContent = String(idx + 1);
+    const tdPlate = document.createElement('td');
+    const codeEl = document.createElement('code');
+    codeEl.textContent = p;
+    tdPlate.appendChild(codeEl);
+    const tdAct = document.createElement('td');
+    const btn = document.createElement('button');
+    btn.className = 'red';
+    btn.textContent = 'Delete';
+    btn.addEventListener('click', ()=>delPlate(p));
+    tdAct.appendChild(btn);
+    tr.appendChild(tdIdx);
+    tr.appendChild(tdPlate);
+    tr.appendChild(tdAct);
+    tb.appendChild(tr);
+  });
 }
 async function refreshStatus(){
   try{
@@ -542,13 +467,7 @@ async function refreshStatus(){
     document.getElementById('perf').textContent = d.processMs + ' ms';
 
     document.getElementById('pcnt').textContent = d.plates.length;
-    const tb = document.getElementById('plist');
-    tb.innerHTML = '';
-    d.plates.forEach((p, idx)=>{
-      const tr = document.createElement('tr');
-      tr.innerHTML = '<td>'+(idx+1)+'</td><td><code>'+p+'</code></td><td><button class="red" onclick="delPlate(\''+p+'\')">Delete</button></td>';
-      tb.appendChild(tr);
-    });
+    renderPlatesTable(d.plates);
 
     if(!cfgLoaded){
       cfgLoaded = true;
@@ -601,20 +520,7 @@ refreshImg(); refreshStatus(); setInterval(refreshStatus, 900);
 }
 
 void handlePreview() {
-  if (!previewMutex || xSemaphoreTake(previewMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-    server.send(503, "text/plain", "Preview busy");
-    return;
-  }
-  if (!g_previewJpg || g_previewJpgLen == 0) {
-    xSemaphoreGive(previewMutex);
-    server.send(503, "text/plain", "Preview not ready");
-    return;
-  }
-  server.sendHeader("Cache-Control", "no-store");
-  server.setContentLength(g_previewJpgLen);
-  server.send(200, "image/jpeg", "");
-  server.sendContent(reinterpret_cast<const char *>(g_previewJpg), g_previewJpgLen);
-  xSemaphoreGive(previewMutex);
+  camHwHandlePreviewRequest(server);
 }
 
 void handleStatus() {
@@ -624,7 +530,7 @@ void handleStatus() {
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     snap = g_status;
     platesCopy = g_plates;
-    cfgCopy = g_cfg;
+    cfgCopy = g_applyCfgPending ? g_pendingCfg : g_cfg;
     xSemaphoreGive(stateMutex);
   }
 
@@ -636,10 +542,10 @@ void handleStatus() {
   json += "\"ip\":\"" + camNetIpString() + "\",";
   json += "\"plateLocalized\":" + String(snap.plateLocalized ? "true" : "false") + ",";
   json += "\"validRead\":" + String(snap.validRead ? "true" : "false") + ",";
-  json += "\"lastResult\":\"" + jsonEscape(snap.lastResult) + "\",";
-  json += "\"lastSource\":\"" + jsonEscape(snap.lastSource) + "\",";
-  json += "\"lastReadText\":\"" + jsonEscape(snap.lastReadText) + "\",";
-  json += "\"lastMatchedPlate\":\"" + jsonEscape(snap.lastMatchedPlate) + "\",";
+  json += "\"lastResult\":\"" + smartHomeJsonEscape(snap.lastResult) + "\",";
+  json += "\"lastSource\":\"" + smartHomeJsonEscape(snap.lastSource) + "\",";
+  json += "\"lastReadText\":\"" + smartHomeJsonEscape(snap.lastReadText) + "\",";
+  json += "\"lastMatchedPlate\":\"" + smartHomeJsonEscape(snap.lastMatchedPlate) + "\",";
   json += "\"lastConf\":" + String(snap.lastConf) + ",";
   json += "\"lastCharCount\":" + String(snap.lastCharCount) + ",";
   json += "\"processMs\":" + String(snap.processMs) + ",";
@@ -647,7 +553,7 @@ void handleStatus() {
   json += "\"plates\":[";
   for (size_t i = 0; i < platesCopy.size(); ++i) {
     if (i > 0) json += ",";
-    json += "\"" + jsonEscape(platesCopy[i].c_str()) + "\"";
+    json += "\"" + smartHomeJsonEscape(platesCopy[i].c_str()) + "\"";
   }
   json += "],\"cfg\":{";
   json += "\"mode\":" + String(cfgCopy.mode) + ",";
@@ -732,9 +638,8 @@ void handleClearPlates() {
 }
 
 void handleConfig() {
-  PlateConfig next;
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    next = g_cfg;
+    PlateConfig next = g_applyCfgPending ? g_pendingCfg : g_cfg;
     if (server.hasArg("mode")) {
       int m = server.arg("mode").toInt();
       next.mode = (m >= 0 && m <= 2) ? static_cast<uint8_t>(m) : PLATE_MODE_AUTO;
@@ -750,12 +655,13 @@ void handleConfig() {
     if (server.hasArg("flash")) next.flashDuty = static_cast<uint8_t>(constrain(server.arg("flash").toInt(), 0, 120));
     if (server.hasArg("hmir")) next.hmirror = (server.arg("hmir").toInt() != 0);
     if (server.hasArg("vflip")) next.vflip = (server.arg("vflip").toInt() != 0);
-    g_cfg = next;
+    g_pendingCfg = next;
+    g_applyCfgPending = true;
     xSemaphoreGive(stateMutex);
+    server.send(200, "application/json", "{\"ok\":true}");
+  } else {
+    server.send(503, "application/json", "{\"ok\":false}");
   }
-  saveConfigToNvs(next);
-  applySensorSettings(next);
-  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleTest() {
@@ -768,24 +674,27 @@ void handleTest() {
 } // namespace
 
 void setup() {
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  setStatusLed(false);
-
-  ledcSetup(FLASH_LEDC_CHANNEL, 5000, 8);
-  ledcAttachPin(FLASH_LED_PIN, FLASH_LEDC_CHANNEL);
-  setFlashLed(0);
+  camHwInitLeds();
 
   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== Smart Home Camera 2: Plate OCR + QR/Barcode (HW-297) ===");
 
   stateMutex = xSemaphoreCreateMutex();
-  previewMutex = xSemaphoreCreateMutex();
+  camHwInitPreview();
 
   loadFromNvs(g_plates, g_cfg);
   bool ocrOk = plateOcrInit();
   bool codeOk = plateCodeInit();
-  bool camOk = initCamera(g_cfg);
+  bool camOk = camHwInitCamera(PIXFORMAT_GRAYSCALE,
+                               FRAMESIZE_QVGA,
+                               12,
+                               g_cfg.hmirror,
+                               g_cfg.vflip,
+                               1);
+  if (camOk) {
+    camHwSetFlashLed(g_cfg.flashDuty);
+  }
 
   if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
     g_status.cameraReady = camOk;

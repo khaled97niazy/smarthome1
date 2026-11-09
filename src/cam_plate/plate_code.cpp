@@ -21,9 +21,20 @@ namespace {
 constexpr int MAX_BARCODE_SCAN_LEN = 640;
 constexpr int MAX_BARCODE_RUNS = 240;
 
+struct BarcodeScratch {
+  uint8_t colBuf[MAX_BARCODE_SCAN_LEN];
+  uint8_t localMin[MAX_BARCODE_SCAN_LEN];
+  uint8_t localMax[MAX_BARCODE_SCAN_LEN];
+  float diff[MAX_BARCODE_SCAN_LEN];
+  float runW[MAX_BARCODE_RUNS];
+  uint8_t runIsBar[MAX_BARCODE_RUNS];
+  float runStart[MAX_BARCODE_RUNS];
+};
+
 struct quirc *s_quirc = nullptr;
 struct quirc_code *s_qrCode = nullptr;
 struct quirc_data *s_qrData = nullptr;
+BarcodeScratch *s_barcodeScratch = nullptr;
 int s_quircW = 0;
 int s_quircH = 0;
 bool s_codeReady = false;
@@ -355,15 +366,17 @@ char decodeCode39Symbol(const float w[9], float *outNarrow, float *outWide) {
 // ---------------------------------------------------------------------------
 int extractScanlineRuns(const uint8_t *line,
                         int len,
-                        float *runW,
-                        uint8_t *runIsBar,
-                        float *runStartPos,
+                        BarcodeScratch &scratch,
                         int maxRuns) {
   if (!line || len < 32 || len > MAX_BARCODE_SCAN_LEN) return 0;
 
   constexpr int WIN = 16;
-  uint8_t localMin[MAX_BARCODE_SCAN_LEN];
-  uint8_t localMax[MAX_BARCODE_SCAN_LEN];
+  uint8_t *localMin = scratch.localMin;
+  uint8_t *localMax = scratch.localMax;
+  float *diff = scratch.diff;
+  float *runW = scratch.runW;
+  uint8_t *runIsBar = scratch.runIsBar;
+  float *runStartPos = scratch.runStart;
 
   for (int x = 0; x < len; ++x) {
     int x0 = std::max(0, x - WIN);
@@ -379,7 +392,6 @@ int extractScanlineRuns(const uint8_t *line,
     localMax[x] = hi;
   }
 
-  float diff[MAX_BARCODE_SCAN_LEN];
   for (int x = 0; x < len; ++x) {
     int contrast = static_cast<int>(localMax[x]) - static_cast<int>(localMin[x]);
     if (contrast < 30) {
@@ -431,24 +443,43 @@ int extractScanlineRuns(const uint8_t *line,
   return count;
 }
 
-bool tryDecodeCode128FromRuns(const float *runW,
-                              const uint8_t *runIsBar,
-                              const float *runStartPos,
+inline int mapRunIdx(int logicalIdx, int nRuns, bool reverse) {
+  return reverse ? (nRuns - 1 - logicalIdx) : logicalIdx;
+}
+
+inline void copyRunWindow(const float *runW,
+                          int nRuns,
+                          int logicalStart,
+                          int count,
+                          bool reverse,
+                          float *dst) {
+  for (int i = 0; i < count; ++i) {
+    dst[i] = runW[mapRunIdx(logicalStart + i, nRuns, reverse)];
+  }
+}
+
+bool tryDecodeCode128FromRuns(const BarcodeScratch &scratch,
                               int nRuns,
+                              bool reverse,
                               char *rawOut,
                               int rawCap,
                               float *outMinPos,
                               float *outMaxPos) {
+  const float *runW = scratch.runW;
+  const uint8_t *runIsBar = scratch.runIsBar;
+  const float *runStartPos = scratch.runStart;
   int syms[48];
+  float win[7];
 
   for (int s = 1; s + 18 <= nRuns; ++s) {
-    if (!runIsBar[s]) continue;
+    if (!runIsBar[mapRunIdx(s, nRuns, reverse)]) continue;
 
     float mod = 0.0f;
-    int startSym = matchCode128Symbol(&runW[s], &mod);
+    copyRunWindow(runW, nRuns, s, 6, reverse, win);
+    int startSym = matchCode128Symbol(win, &mod);
     if (startSym < 103 || startSym > 105) continue;
 
-    if (runW[s - 1] < 1.5f * mod) continue;
+    if (runW[mapRunIdx(s - 1, nRuns, reverse)] < 1.5f * mod) continue;
 
     syms[0] = startSym;
     int symCount = 1;
@@ -458,14 +489,17 @@ bool tryDecodeCode128FromRuns(const float *runW,
     while (pos + 6 <= nRuns && symCount < 48) {
       if (pos + 7 <= nRuns) {
         float stopMod = 0.0f;
-        if (isCode128Stop(&runW[pos], &stopMod)) {
-          bool quietAfter = (pos + 7 >= nRuns) || (runW[pos + 7] >= 1.8f * stopMod);
+        copyRunWindow(runW, nRuns, pos, 7, reverse, win);
+        if (isCode128Stop(win, &stopMod)) {
+          bool quietAfter = (pos + 7 >= nRuns) ||
+                            (runW[mapRunIdx(pos + 7, nRuns, reverse)] >= 1.8f * stopMod);
           if (quietAfter && decodeCode128Sequence(syms, symCount, rawOut, rawCap)) {
-            if (outMinPos) *outMinPos = runStartPos[s];
-            if (outMaxPos) {
-              float lastSpan = runW[pos + 6];
-              *outMaxPos = runStartPos[pos + 6] + lastSpan;
-            }
+            int idxA = mapRunIdx(s, nRuns, reverse);
+            int idxB = mapRunIdx(pos + 6, nRuns, reverse);
+            int leftIdx = reverse ? idxB : idxA;
+            int rightIdx = reverse ? idxA : idxB;
+            if (outMinPos) *outMinPos = runStartPos[leftIdx];
+            if (outMaxPos) *outMaxPos = runStartPos[rightIdx] + runW[rightIdx];
             hitStop = true;
             break;
           }
@@ -474,7 +508,8 @@ bool tryDecodeCode128FromRuns(const float *runW,
 
       if (pos + 6 > nRuns) break;
       float symMod = 0.0f;
-      int nextSym = matchCode128Symbol(&runW[pos], &symMod);
+      copyRunWindow(runW, nRuns, pos, 6, reverse, win);
+      int nextSym = matchCode128Symbol(win, &symMod);
       if (nextSym < 0 || nextSym > 102) break;
       if (symMod < mod * 0.65f || symMod > mod * 1.45f) break;
 
@@ -487,20 +522,25 @@ bool tryDecodeCode128FromRuns(const float *runW,
   return false;
 }
 
-bool tryDecodeCode39FromRuns(const float *runW,
-                             const uint8_t *runIsBar,
-                             const float *runStartPos,
+bool tryDecodeCode39FromRuns(const BarcodeScratch &scratch,
                              int nRuns,
+                             bool reverse,
                              char *rawOut,
                              int rawCap,
                              float *outMinPos,
                              float *outMaxPos) {
+  const float *runW = scratch.runW;
+  const uint8_t *runIsBar = scratch.runIsBar;
+  const float *runStartPos = scratch.runStart;
+  float win[9];
+
   for (int s = 1; s + 28 <= nRuns; ++s) {
-    if (!runIsBar[s]) continue;
+    if (!runIsBar[mapRunIdx(s, nRuns, reverse)]) continue;
 
     float narrow0 = 0.0f, wide0 = 0.0f;
-    if (decodeCode39Symbol(&runW[s], &narrow0, &wide0) != '*') continue;
-    if (runW[s - 1] < 1.5f * narrow0) continue;
+    copyRunWindow(runW, nRuns, s, 9, reverse, win);
+    if (decodeCode39Symbol(win, &narrow0, &wide0) != '*') continue;
+    if (runW[mapRunIdx(s - 1, nRuns, reverse)] < 1.5f * narrow0) continue;
 
     int len = 0;
     int pos = s + 9;
@@ -508,24 +548,30 @@ bool tryDecodeCode39FromRuns(const float *runW,
     bool closed = false;
 
     while (pos + 9 < nRuns && len + 1 < rawCap) {
-      if (runIsBar[pos]) break;
-      float gap = runW[pos];
+      if (runIsBar[mapRunIdx(pos, nRuns, reverse)]) break;
+      float gap = runW[mapRunIdx(pos, nRuns, reverse)];
       if (gap < refNarrow * 0.40f || gap > refNarrow * 2.4f) break;
 
       int charPos = pos + 1;
       if (charPos + 9 > nRuns) break;
 
       float curN = 0.0f, curW = 0.0f;
-      char ch = decodeCode39Symbol(&runW[charPos], &curN, &curW);
+      copyRunWindow(runW, nRuns, charPos, 9, reverse, win);
+      char ch = decodeCode39Symbol(win, &curN, &curW);
       if (ch == '\0') break;
       if (curN < refNarrow * 0.60f || curN > refNarrow * 1.60f) break;
 
       if (ch == '*') {
-        bool quietAfter = (charPos + 9 >= nRuns) || (runW[charPos + 9] >= 1.8f * curN);
+        bool quietAfter = (charPos + 9 >= nRuns) ||
+                          (runW[mapRunIdx(charPos + 9, nRuns, reverse)] >= 1.8f * curN);
         if (quietAfter && len >= 3) {
           rawOut[len] = '\0';
-          if (outMinPos) *outMinPos = runStartPos[s];
-          if (outMaxPos) *outMaxPos = runStartPos[charPos + 8] + runW[charPos + 8];
+          int idxA = mapRunIdx(s, nRuns, reverse);
+          int idxB = mapRunIdx(charPos + 8, nRuns, reverse);
+          int leftIdx = reverse ? idxB : idxA;
+          int rightIdx = reverse ? idxA : idxB;
+          if (outMinPos) *outMinPos = runStartPos[leftIdx];
+          if (outMaxPos) *outMaxPos = runStartPos[rightIdx] + runW[rightIdx];
           closed = true;
         }
         break;
@@ -552,38 +598,22 @@ struct BarcodeCandidate {
 void analyzeBarcodeLine(const uint8_t *line,
                         int len,
                         int coordFixed,
+                        int imgW,
+                        int imgH,
                         bool horizontal,
+                        BarcodeScratch &scratch,
                         std::vector<BarcodeCandidate> &c39Candidates,
                         PlateCodeResult &out,
                         bool &foundStrong) {
-  float runW[MAX_BARCODE_RUNS];
-  uint8_t runIsBar[MAX_BARCODE_RUNS];
-  float runStart[MAX_BARCODE_RUNS];
-
-  int nRuns = extractScanlineRuns(line, len, runW, runIsBar, runStart, MAX_BARCODE_RUNS);
+  int nRuns = extractScanlineRuns(line, len, scratch, MAX_BARCODE_RUNS);
   if (nRuns < 18) return;
-
-  float revW[MAX_BARCODE_RUNS];
-  uint8_t revBar[MAX_BARCODE_RUNS];
-  float revStart[MAX_BARCODE_RUNS];
-  for (int i = 0; i < nRuns; ++i) {
-    int j = nRuns - 1 - i;
-    revW[i] = runW[j];
-    revBar[i] = runIsBar[j];
-    revStart[i] = static_cast<float>(len) - (runStart[j] + runW[j]);
-  }
 
   // 1) Try Code 128 first (has mandatory Modulo-103 checksum + Start + Stop)
   char rawBuf[48];
   float p0 = 0.0f, p1 = 0.0f;
-  bool c128Ok = tryDecodeCode128FromRuns(runW, runIsBar, runStart, nRuns, rawBuf, sizeof(rawBuf), &p0, &p1);
+  bool c128Ok = tryDecodeCode128FromRuns(scratch, nRuns, false, rawBuf, sizeof(rawBuf), &p0, &p1);
   if (!c128Ok) {
-    float r0 = 0.0f, r1 = 0.0f;
-    if (tryDecodeCode128FromRuns(revW, revBar, revStart, nRuns, rawBuf, sizeof(rawBuf), &r0, &r1)) {
-      p0 = static_cast<float>(len) - r1;
-      p1 = static_cast<float>(len) - r0;
-      c128Ok = true;
-    }
+    c128Ok = tryDecodeCode128FromRuns(scratch, nRuns, true, rawBuf, sizeof(rawBuf), &p0, &p1);
   }
   if (c128Ok) {
     char normText[16], trimmedRaw[32];
@@ -596,12 +626,12 @@ void analyzeBarcodeLine(const uint8_t *line,
       snprintf(out.text, sizeof(out.text), "%s", normText);
       snprintf(out.rawPayload, sizeof(out.rawPayload), "%s", trimmedRaw);
 
-      int a = static_cast<int>(lroundf(p0));
-      int b = static_cast<int>(lroundf(p1));
+      int a = std::max(0, std::min(len - 1, static_cast<int>(lroundf(p0))));
+      int b = std::max(0, std::min(len - 1, static_cast<int>(lroundf(p1))));
       int x0 = horizontal ? a : std::max(0, coordFixed - 12);
       int y0 = horizontal ? std::max(0, coordFixed - 12) : a;
-      int x1 = horizontal ? b : std::min(639, coordFixed + 12);
-      int y1 = horizontal ? std::min(479, coordFixed + 12) : b;
+      int x1 = horizontal ? b : std::min(imgW - 1, coordFixed + 12);
+      int y1 = horizontal ? std::min(imgH - 1, coordFixed + 12) : b;
 
       out.cornersX[0] = static_cast<int16_t>(x0);
       out.cornersY[0] = static_cast<int16_t>(y0);
@@ -617,25 +647,20 @@ void analyzeBarcodeLine(const uint8_t *line,
   }
 
   // 2) Try Code 39 (accumulate across scanlines; require >= 2 agreeing scanlines)
-  bool c39Ok = tryDecodeCode39FromRuns(runW, runIsBar, runStart, nRuns, rawBuf, sizeof(rawBuf), &p0, &p1);
+  bool c39Ok = tryDecodeCode39FromRuns(scratch, nRuns, false, rawBuf, sizeof(rawBuf), &p0, &p1);
   if (!c39Ok) {
-    float r0 = 0.0f, r1 = 0.0f;
-    if (tryDecodeCode39FromRuns(revW, revBar, revStart, nRuns, rawBuf, sizeof(rawBuf), &r0, &r1)) {
-      p0 = static_cast<float>(len) - r1;
-      p1 = static_cast<float>(len) - r0;
-      c39Ok = true;
-    }
+    c39Ok = tryDecodeCode39FromRuns(scratch, nRuns, true, rawBuf, sizeof(rawBuf), &p0, &p1);
   }
   if (c39Ok) {
     char normText[16], trimmedRaw[32];
     extractRawAndPlateText(rawBuf, static_cast<int>(strlen(rawBuf)), normText, trimmedRaw);
     if (strlen(normText) >= 3) {
-      int a = static_cast<int>(lroundf(p0));
-      int b = static_cast<int>(lroundf(p1));
+      int a = std::max(0, std::min(len - 1, static_cast<int>(lroundf(p0))));
+      int b = std::max(0, std::min(len - 1, static_cast<int>(lroundf(p1))));
       int x0 = horizontal ? a : std::max(0, coordFixed - 8);
       int y0 = horizontal ? std::max(0, coordFixed - 8) : a;
-      int x1 = horizontal ? b : coordFixed + 8;
-      int y1 = horizontal ? coordFixed + 8 : b;
+      int x1 = horizontal ? b : std::min(imgW - 1, coordFixed + 8);
+      int y1 = horizontal ? std::min(imgH - 1, coordFixed + 8) : b;
 
       for (auto &cand : c39Candidates) {
         if (strcmp(cand.text, normText) == 0) {
@@ -715,8 +740,10 @@ bool plateCodeInit() {
   s_quirc = quirc_new();
   s_qrCode = static_cast<struct quirc_code *>(codeAllocPsram(sizeof(struct quirc_code)));
   s_qrData = static_cast<struct quirc_data *>(codeAllocPsram(sizeof(struct quirc_data)));
+  s_barcodeScratch = static_cast<BarcodeScratch *>(codeAllocPsram(sizeof(BarcodeScratch)));
 
-  s_codeReady = (s_quirc != nullptr && s_qrCode != nullptr && s_qrData != nullptr);
+  s_codeReady = (s_quirc != nullptr && s_qrCode != nullptr &&
+                 s_qrData != nullptr && s_barcodeScratch != nullptr);
   if (!s_codeReady) {
     if (s_quirc) {
       quirc_destroy(s_quirc);
@@ -726,6 +753,8 @@ bool plateCodeInit() {
     s_qrCode = nullptr;
     free(s_qrData);
     s_qrData = nullptr;
+    free(s_barcodeScratch);
+    s_barcodeScratch = nullptr;
   }
   return s_codeReady;
 }
@@ -805,18 +834,20 @@ void plateCodeAnalyze(const uint8_t *gray,
     // Horizontal scanlines
     int stepY = std::max(8, height / 20);
     for (int y = stepY; y < height - stepY && !foundStrong; y += stepY) {
-      analyzeBarcodeLine(gray + y * width, width, y, true, c39Candidates, out, foundStrong);
+      analyzeBarcodeLine(gray + y * width, width, y, width, height, true,
+                         *s_barcodeScratch, c39Candidates, out, foundStrong);
     }
     if (foundStrong) return;
 
     // Vertical scanlines (for 90-degree rotated barcodes)
-    uint8_t colBuf[MAX_BARCODE_SCAN_LEN];
+    uint8_t *colBuf = s_barcodeScratch->colBuf;
     int stepX = std::max(16, width / 12);
     for (int x = stepX; x < width - stepX && !foundStrong; x += stepX) {
       for (int y = 0; y < height; ++y) {
         colBuf[y] = gray[y * width + x];
       }
-      analyzeBarcodeLine(colBuf, height, x, false, c39Candidates, out, foundStrong);
+      analyzeBarcodeLine(colBuf, height, x, width, height, false,
+                         *s_barcodeScratch, c39Candidates, out, foundStrong);
     }
     if (foundStrong) return;
 

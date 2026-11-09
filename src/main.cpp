@@ -12,6 +12,8 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_timer.h>
+#include "smart_home_json.h"
 #include "smart_home_protocol.h"
 
 // ---------------------------------------------------------------------------
@@ -75,9 +77,9 @@ const int SERVO_STEP_DEG = 2;
 const unsigned long SERVO_STEP_INTERVAL_MS = 20;
 
 // ---------------------------------------------------------------------------
-// Siren (ESP32 LEDC tone generation, Arduino-ESP32 core 3.x)
+// Siren (ESP32 LEDC tone generation, Arduino-ESP32 core 3.x uses 10-bit tone)
 // ---------------------------------------------------------------------------
-const int SIREN_RESOLUTION_BITS = 8;
+const int SIREN_RESOLUTION_BITS = 10;
 const int SIREN_LOW_HZ = 700;
 const int SIREN_HIGH_HZ = 1800;
 const int SIREN_STEP_HZ = 60;
@@ -89,6 +91,7 @@ int sirenDirection = 1;
 unsigned long lastSirenMs = 0;
 unsigned long lastPrintMs = 0;
 bool sirenActive = false;
+bool buzzerAttached = false;
 
 Servo gateServo1;
 Servo gateServo2;
@@ -109,6 +112,14 @@ float lastDistanceCm = -1.0f;
 bool lastUltrasonicDetected = false;
 bool gateOpen = false;
 
+portMUX_TYPE echoMux = portMUX_INITIALIZER_UNLOCKED;
+volatile int64_t echoRiseUs = 0;
+volatile int64_t echoPulseUs = 0;
+volatile bool echoMeasuring = false;
+volatile bool echoComplete = false;
+bool echoWaiting = false;
+int64_t echoTriggerUs = 0;
+
 unsigned long doorOpenUntilMs = 0;
 bool doorOpen = false;
 
@@ -123,6 +134,7 @@ struct CamNodeTelemetry {
   int16_t lastMatchId = -1;
   uint8_t lastConfidence = 0;
   uint32_t lastSeq = 0;
+  uint8_t lastMac[6] = {0};
   char lastLabel[24] = "none";
 };
 
@@ -197,6 +209,7 @@ int servoAngleToPulseUs(int angle) {
 
 bool attachGateServo(Servo &servo, int pin, int initialAngle, const char *label) {
   servo.setPeriodHertz(SERVO_PWM_FREQ_HZ);
+  servo.setTimerWidth(SERVO_PWM_RES_BITS);
   servo.attach(pin, SERVO_MIN_US, SERVO_MAX_US);
   if (!servo.attached()) {
     Serial.print("WARNING: Failed to attach ");
@@ -205,7 +218,6 @@ bool attachGateServo(Servo &servo, int pin, int initialAngle, const char *label)
     Serial.println(pin);
     return false;
   }
-  servo.setTimerWidth(SERVO_PWM_RES_BITS);
   servo.writeMicroseconds(servoAngleToPulseUs(initialAngle));
   return true;
 }
@@ -268,35 +280,87 @@ void updateAllServos(unsigned long now) {
   }
 }
 
-float readUltrasonicCm() {
-  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+void IRAM_ATTR onUltrasonicEchoChange() {
+  int level = digitalRead(ULTRASONIC_ECHO_PIN);
+  int64_t nowUs = esp_timer_get_time();
 
-  unsigned long durationUs = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, ULTRASONIC_TIMEOUT_US);
-  if (durationUs == 0) {
-    return -1.0f; // Out of range / no echo received
+  portENTER_CRITICAL_ISR(&echoMux);
+  if (level == HIGH) {
+    echoRiseUs = nowUs;
+    echoMeasuring = true;
+    echoComplete = false;
+  } else if (echoMeasuring) {
+    echoPulseUs = nowUs - echoRiseUs;
+    echoMeasuring = false;
+    echoComplete = true;
   }
-  return (durationUs * 0.0343f) / 2.0f;
+  portEXIT_CRITICAL_ISR(&echoMux);
+}
+
+void recordUltrasonicSample(float distCm, unsigned long now) {
+  lastDistanceCm = distCm;
+  bool objectNear = (lastDistanceCm > 0.0f && lastDistanceCm <= ULTRASONIC_TRIGGER_DISTANCE_CM);
+  if (objectNear) {
+    if (ultrasonicConfirmCount < ULTRASONIC_CONFIRM_READS) {
+      ultrasonicConfirmCount++;
+    }
+    if (ultrasonicConfirmCount >= ULTRASONIC_CONFIRM_READS) {
+      ultrasonicAlarmUntilMs = now + ULTRASONIC_ALARM_HOLD_MS;
+    }
+  } else {
+    ultrasonicConfirmCount = 0;
+  }
 }
 
 void updateUltrasonicSensor(unsigned long now) {
-  if (now - lastUltrasonicMs >= ULTRASONIC_INTERVAL_MS) {
-    lastUltrasonicMs = now;
-    lastDistanceCm = readUltrasonicCm();
+  int64_t nowUs = esp_timer_get_time();
 
-    bool objectNear = (lastDistanceCm > 0.0f && lastDistanceCm <= ULTRASONIC_TRIGGER_DISTANCE_CM);
-    if (objectNear) {
-      if (ultrasonicConfirmCount < ULTRASONIC_CONFIRM_READS) {
-        ultrasonicConfirmCount++;
-      }
-      if (ultrasonicConfirmCount >= ULTRASONIC_CONFIRM_READS) {
-        ultrasonicAlarmUntilMs = now + ULTRASONIC_ALARM_HOLD_MS;
-      }
+  if (echoWaiting) {
+    bool completed = false;
+    int64_t pulseUs = 0;
+    portENTER_CRITICAL(&echoMux);
+    if (echoComplete) {
+      completed = true;
+      pulseUs = echoPulseUs;
+      echoComplete = false;
+    }
+    portEXIT_CRITICAL(&echoMux);
+
+    if (completed) {
+      echoWaiting = false;
+      float distCm = (pulseUs > 0 && pulseUs <= static_cast<int64_t>(ULTRASONIC_TIMEOUT_US))
+                         ? (static_cast<float>(pulseUs) * 0.0343f) / 2.0f
+                         : -1.0f;
+      recordUltrasonicSample(distCm, now);
+    } else if (nowUs - echoTriggerUs > static_cast<int64_t>(ULTRASONIC_TIMEOUT_US)) {
+      portENTER_CRITICAL(&echoMux);
+      echoMeasuring = false;
+      echoComplete = false;
+      portEXIT_CRITICAL(&echoMux);
+      echoWaiting = false;
+      recordUltrasonicSample(-1.0f, now);
+    }
+  }
+
+  if (!echoWaiting && (now - lastUltrasonicMs >= ULTRASONIC_INTERVAL_MS)) {
+    lastUltrasonicMs = now;
+    if (digitalRead(ULTRASONIC_ECHO_PIN) == HIGH) {
+      // ECHO line still active or floating HIGH; wait for clean LOW before next trigger
+      recordUltrasonicSample(-1.0f, now);
     } else {
-      ultrasonicConfirmCount = 0;
+      portENTER_CRITICAL(&echoMux);
+      echoMeasuring = false;
+      echoComplete = false;
+      portEXIT_CRITICAL(&echoMux);
+
+      digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+      delayMicroseconds(2);
+      digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
+      delayMicroseconds(10);
+      digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+
+      echoTriggerUs = esp_timer_get_time();
+      echoWaiting = true;
     }
   }
 
@@ -326,22 +390,31 @@ void updateServosControl(unsigned long now) {
   updateAllServos(now);
 }
 
-void startSiren() {
+void startSiren(unsigned long now) {
   if (sirenActive) return;
-  ledcAttach(BUZZER_PIN, sirenHz, SIREN_RESOLUTION_BITS);
-  ledcWrite(BUZZER_PIN, 128); // 50% duty cycle
+  sirenHz = SIREN_LOW_HZ;
+  sirenDirection = 1;
+  lastSirenMs = now;
+  if (buzzerAttached) {
+    ledcWriteTone(BUZZER_PIN, sirenHz);
+  }
   sirenActive = true;
 }
 
 void stopSiren() {
   if (!sirenActive) return;
-  ledcWrite(BUZZER_PIN, 0);
-  ledcDetach(BUZZER_PIN);
-  digitalWrite(BUZZER_PIN, LOW);
+  if (buzzerAttached) {
+    ledcWriteTone(BUZZER_PIN, 0);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+  sirenHz = SIREN_LOW_HZ;
+  sirenDirection = 1;
   sirenActive = false;
 }
 
 void updateSiren(unsigned long now) {
+  if (!buzzerAttached) return;
   if (now - lastSirenMs < SIREN_STEP_MS) return;
   lastSirenMs = now;
 
@@ -371,6 +444,12 @@ const char *eventTypeName(uint8_t ev) {
 
 void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
   const auto &pkt = item.pkt;
+  if (pkt.event != SmartHomeNet::CAM_EVENT_RECOGNIZED &&
+      pkt.event != SmartHomeNet::CAM_EVENT_UNKNOWN &&
+      pkt.event != SmartHomeNet::CAM_EVENT_HEARTBEAT) {
+    return;
+  }
+
   CamNodeTelemetry *telemetry = nullptr;
   const char *srcName = "UNKNOWN";
 
@@ -384,18 +463,42 @@ void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
     return;
   }
 
+  bool firstContact = !telemetry->seen || (memcmp(telemetry->lastMac, item.srcMac, 6) != 0);
+  if (telemetry->seen && pkt.seq != 0) {
+    if (pkt.seq == telemetry->lastSeq) {
+      telemetry->lastSeenMs = now;
+      return; // Ignore duplicate packet sequence
+    }
+    if (pkt.seq < telemetry->lastSeq) {
+      // Camera rebooted (sequence counter restarted); reset last event state
+      telemetry->lastEvent = 0;
+      telemetry->lastMatchId = -1;
+      telemetry->lastConfidence = 0;
+      snprintf(telemetry->lastLabel, sizeof(telemetry->lastLabel), "%s", "none");
+    }
+  }
+
   telemetry->seen = true;
   telemetry->lastSeenMs = now;
+  telemetry->lastSeq = pkt.seq;
+  memcpy(telemetry->lastMac, item.srcMac, 6);
+
+  if (firstContact) {
+    Serial.printf("[ESP-NOW] %s linked (%02X:%02X:%02X:%02X:%02X:%02X)\n",
+                  srcName,
+                  item.srcMac[0], item.srcMac[1], item.srcMac[2],
+                  item.srcMac[3], item.srcMac[4], item.srcMac[5]);
+  }
 
   if (pkt.event == SmartHomeNet::CAM_EVENT_HEARTBEAT) {
     return;
   }
 
+  uint8_t conf = min<uint8_t>(pkt.confidence, 100);
   telemetry->lastEventMs = now;
   telemetry->lastEvent = pkt.event;
   telemetry->lastMatchId = pkt.matchId;
-  telemetry->lastConfidence = pkt.confidence;
-  telemetry->lastSeq = pkt.seq;
+  telemetry->lastConfidence = conf;
   strncpy(telemetry->lastLabel, pkt.label, sizeof(telemetry->lastLabel) - 1);
   telemetry->lastLabel[sizeof(telemetry->lastLabel) - 1] = '\0';
 
@@ -403,7 +506,7 @@ void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
                 srcName,
                 eventTypeName(pkt.event),
                 pkt.matchId,
-                pkt.confidence,
+                conf,
                 telemetry->lastLabel,
                 static_cast<unsigned long>(pkt.seq));
 
@@ -419,21 +522,6 @@ void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
   } else if (pkt.event == SmartHomeNet::CAM_EVENT_UNKNOWN) {
     camAlarmUntilMs = now + CAM_ALARM_DURATION_MS;
   }
-}
-
-String jsonEscape(const char *s) {
-  String out;
-  if (!s) return out;
-  for (size_t i = 0; s[i] != '\0'; ++i) {
-    char c = s[i];
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += c;
-    } else if (static_cast<uint8_t>(c) >= 0x20) {
-      out += c;
-    }
-  }
-  return out;
 }
 
 void handleRoot() {
@@ -529,6 +617,10 @@ void handleApiStatus() {
   bool camAlarmActive = (camAlarmUntilMs != 0 && static_cast<long>(camAlarmUntilMs - now) > 0);
   bool faceOnline = faceCamState.seen && (now - faceCamState.lastSeenMs <= CAM_ONLINE_TIMEOUT_MS);
   bool plateOnline = plateCamState.seen && (now - plateCamState.lastSeenMs <= CAM_ONLINE_TIMEOUT_MS);
+  uint32_t droppedSnapshot = 0;
+  portENTER_CRITICAL(&rxMux);
+  droppedSnapshot = rxDropped;
+  portEXIT_CRITICAL(&rxMux);
 
   String json = "{";
   json += "\"flameAdc\":" + String(lastFlameAdc) + ",";
@@ -546,17 +638,17 @@ void handleApiStatus() {
   json += "\"servo2\":" + String(currentServo2Angle) + ",";
   json += "\"doorOpen\":" + String(doorOpen ? "true" : "false") + ",";
   json += "\"door3\":" + String(currentDoor3Angle) + ",";
-  json += "\"rxDropped\":" + String(rxDropped) + ",";
+  json += "\"rxDropped\":" + String(droppedSnapshot) + ",";
   json += "\"faceCam\":{\"online\":" + String(faceOnline ? "true" : "false") +
           ",\"event\":\"" + String(eventTypeName(faceCamState.lastEvent)) + "\"" +
           ",\"id\":" + String(faceCamState.lastMatchId) +
           ",\"conf\":" + String(faceCamState.lastConfidence) +
-          ",\"label\":\"" + jsonEscape(faceCamState.lastLabel) + "\"},";
+          ",\"label\":\"" + smartHomeJsonEscape(faceCamState.lastLabel) + "\"},";
   json += "\"plateCam\":{\"online\":" + String(plateOnline ? "true" : "false") +
           ",\"event\":\"" + String(eventTypeName(plateCamState.lastEvent)) + "\"" +
           ",\"id\":" + String(plateCamState.lastMatchId) +
           ",\"conf\":" + String(plateCamState.lastConfidence) +
-          ",\"label\":\"" + jsonEscape(plateCamState.lastLabel) + "\"}";
+          ",\"label\":\"" + smartHomeJsonEscape(plateCamState.lastLabel) + "\"}";
   json += "}";
 
   server.sendHeader("Cache-Control", "no-store");
@@ -574,6 +666,7 @@ void setup() {
   pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
   digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
   pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(ULTRASONIC_ECHO_PIN), onUltrasonicEchoChange, CHANGE);
 
   Serial.begin(115200);
   delay(200);
@@ -582,6 +675,13 @@ void setup() {
   attachGateServo(gateServo1, GATE_SERVO_1_PIN, currentServo1Angle, "gate servo 1");
   attachGateServo(gateServo2, GATE_SERVO_2_PIN, currentServo2Angle, "gate servo 2");
   attachGateServo(doorServo3, DOOR_SERVO_3_PIN, currentDoor3Angle, "face door servo 3");
+
+  buzzerAttached = ledcAttach(BUZZER_PIN, SIREN_LOW_HZ, SIREN_RESOLUTION_BITS);
+  if (buzzerAttached) {
+    ledcWriteTone(BUZZER_PIN, 0);
+  } else {
+    Serial.println("WARNING: Failed to attach LEDC timer for buzzer siren.");
+  }
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
@@ -674,7 +774,7 @@ void loop() {
                     lastUltrasonicDetected || camAlarmActive;
 
   if (lastAlarmActive) {
-    startSiren();
+    startSiren(now);
     updateSiren(now);
   } else {
     stopSiren();

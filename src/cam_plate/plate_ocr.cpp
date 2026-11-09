@@ -769,10 +769,23 @@ bool s_ocrReady = false;
 // Reusable scratch buffers in PSRAM/heap to prevent heap fragmentation
 uint8_t *s_blockMask = nullptr;
 size_t s_blockMaskCap = 0;
+uint8_t *s_binGrid = nullptr;
+uint8_t *s_visited = nullptr;
+int32_t *s_blockQueue = nullptr;
 uint8_t *s_binBuf = nullptr;
 int32_t *s_queueBuf = nullptr;
 float s_patchRaw[256];
 float s_patchBlur[256];
+std::vector<BlockCandidate> s_rois;
+std::vector<RawBlob> s_roiBlobs;
+std::vector<RawBlob> s_roiAligned;
+std::vector<RawBlob> s_curCluster;
+std::vector<RawBlob> s_bestCluster;
+
+void *ocrAllocPsram(size_t bytes) {
+  void *ptr = ps_malloc(bytes);
+  return ptr ? ptr : malloc(bytes);
+}
 
 void blurAndNormalize16x16(const float *src, float *dst) {
   for (int y = 0; y < 16; ++y) {
@@ -808,50 +821,22 @@ void blurAndNormalize16x16(const float *src, float *dst) {
   }
 }
 
-uint8_t computeOtsuThreshold(const uint8_t *gray, int width, int x0, int y0, int rw, int rh) {
+void analyzeRoiStats(const uint8_t *gray,
+                     int width,
+                     int x0,
+                     int y0,
+                     int rw,
+                     int rh,
+                     bool &hasContrastOut,
+                     uint8_t &otsuOut) {
   uint32_t hist[256] = {0};
   uint32_t total = static_cast<uint32_t>(rw * rh);
-  if (total == 0) return 128;
-
-  for (int y = 0; y < rh; ++y) {
-    const uint8_t *row = gray + (y0 + y) * width + x0;
-    for (int x = 0; x < rw; ++x) {
-      hist[row[x]]++;
-    }
+  if (total == 0) {
+    hasContrastOut = false;
+    otsuOut = 128;
+    return;
   }
 
-  double sumAll = 0.0;
-  for (int i = 0; i < 256; ++i) {
-    sumAll += static_cast<double>(i) * hist[i];
-  }
-
-  double sumBg = 0.0;
-  uint32_t wBg = 0;
-  double maxBetween = -1.0;
-  uint8_t bestThresh = 128;
-
-  for (int t = 0; t < 256; ++t) {
-    wBg += hist[t];
-    if (wBg == 0) continue;
-    uint32_t wFg = total - wBg;
-    if (wFg == 0) break;
-
-    sumBg += static_cast<double>(t) * hist[t];
-    double mBg = sumBg / wBg;
-    double mFg = (sumAll - sumBg) / wFg;
-    double diff = mBg - mFg;
-    double between = static_cast<double>(wBg) * static_cast<double>(wFg) * diff * diff;
-    if (between > maxBetween) {
-      maxBetween = between;
-      bestThresh = static_cast<uint8_t>(t);
-    }
-  }
-  return bestThresh;
-}
-
-bool roiHasContrast(const uint8_t *gray, int width, int x0, int y0, int rw, int rh) {
-  uint32_t hist[256] = {0};
-  uint32_t total = static_cast<uint32_t>(rw * rh);
   for (int y = 0; y < rh; ++y) {
     const uint8_t *row = gray + (y0 + y) * width + x0;
     for (int x = 0; x < rw; ++x) {
@@ -865,19 +850,55 @@ bool roiHasContrast(const uint8_t *gray, int width, int x0, int y0, int rw, int 
   int p5 = 0;
   int p95 = 255;
   bool foundLow = false;
+  bool foundHigh = false;
+  double sumAll = 0.0;
 
   for (int i = 0; i < 256; ++i) {
-    acc += hist[i];
+    uint32_t h = hist[i];
+    sumAll += static_cast<double>(i) * h;
+    acc += h;
     if (!foundLow && acc >= targetLow) {
       p5 = i;
       foundLow = true;
     }
-    if (acc >= targetHigh) {
+    if (!foundHigh && acc >= targetHigh) {
       p95 = i;
-      break;
+      foundHigh = true;
     }
   }
-  return (p95 - p5) >= 42;
+  // Ensure p95 stays accurate if targetHigh coincided cleanly inside loop
+  hasContrastOut = (p95 - p5) >= 42;
+  if (!hasContrastOut) {
+    otsuOut = 128;
+    return;
+  }
+
+  double sumBg = 0.0;
+  uint32_t wBg = 0;
+  double maxBetween = -1.0;
+  int firstMaxT = 128;
+  int lastMaxT = 128;
+
+  for (int t = 0; t < 256; ++t) {
+    wBg += hist[t];
+    if (wBg == 0) continue;
+    uint32_t wFg = total - wBg;
+    if (wFg == 0) break;
+
+    sumBg += static_cast<double>(t) * hist[t];
+    double mBg = sumBg / wBg;
+    double mFg = (sumAll - sumBg) / wFg;
+    double diff = mBg - mFg;
+    double between = static_cast<double>(wBg) * static_cast<double>(wFg) * diff * diff;
+    if (between > maxBetween + 1e-9) {
+      maxBetween = between;
+      firstMaxT = t;
+      lastMaxT = t;
+    } else if (between >= maxBetween - 1e-9) {
+      lastMaxT = t;
+    }
+  }
+  otsuOut = static_cast<uint8_t>((firstMaxT + lastMaxT) / 2);
 }
 
 void buildBinaryRoi(const uint8_t *gray,
@@ -995,7 +1016,7 @@ void extractCandidateBlobs(uint8_t *bin,
         }
       }
 
-      if (bw <= (bh * 12) / 10) {
+      if (bw * 100 <= bh * 125) {
         outBlobs.push_back({minX, minY, maxX, maxY, area});
       }
     }
@@ -1009,43 +1030,43 @@ void clusterAlignedCharacters(const std::vector<RawBlob> &blobs,
   if (blobs.size() < 3) return;
 
   int bestClusterScore = -1;
-  std::vector<RawBlob> bestCluster;
+  s_bestCluster.clear();
 
   for (size_t i = 0; i < blobs.size(); ++i) {
     int refH = blobs[i].maxY - blobs[i].minY + 1;
     int refCy = (blobs[i].minY + blobs[i].maxY) / 2;
-    std::vector<RawBlob> cur;
+    s_curCluster.clear();
     for (size_t j = 0; j < blobs.size(); ++j) {
       int h = blobs[j].maxY - blobs[j].minY + 1;
       int cy = (blobs[j].minY + blobs[j].maxY) / 2;
       if (h * 100 >= refH * 68 && h * 100 <= refH * 142 &&
           abs(cy - refCy) * 100 <= refH * 38) {
-        cur.push_back(blobs[j]);
+        s_curCluster.push_back(blobs[j]);
       }
     }
 
-    if (cur.size() >= 3) {
-      int score = static_cast<int>(cur.size()) * 100 + refH;
+    if (s_curCluster.size() >= 3) {
+      int score = static_cast<int>(s_curCluster.size()) * 100 + refH;
       if (score > bestClusterScore) {
         bestClusterScore = score;
-        bestCluster = cur;
+        s_bestCluster = s_curCluster;
       }
     }
   }
 
-  if (bestCluster.size() < 3) return;
+  if (s_bestCluster.size() < 3) return;
 
-  std::sort(bestCluster.begin(), bestCluster.end(), [](const RawBlob &a, const RawBlob &b) {
+  std::sort(s_bestCluster.begin(), s_bestCluster.end(), [](const RawBlob &a, const RawBlob &b) {
     return a.minX < b.minX;
   });
 
   // Drop outliers whose gap to the main run exceeds 1.8x average char height
-  if (bestCluster.size() > 10) {
-    bestCluster.resize(10);
+  if (s_bestCluster.size() > 10) {
+    s_bestCluster.resize(10);
   }
 
   // Filter horizontally overlapping duplicates (keep taller/larger blob)
-  for (const auto &b : bestCluster) {
+  for (const auto &b : s_bestCluster) {
     if (!aligned.empty()) {
       RawBlob &prev = aligned.back();
       int overlap = min(prev.maxX, b.maxX) - max(prev.minX, b.minX) + 1;
@@ -1160,12 +1181,10 @@ void evaluateRoiPolarity(const uint8_t *gray,
                          PlateOcrResult &candidateResult) {
   buildBinaryRoi(gray, width, rx, ry, rw, rh, thresh, darkOnLight, s_binBuf);
 
-  std::vector<RawBlob> blobs;
-  extractCandidateBlobs(s_binBuf, rw, rh, blobs);
+  extractCandidateBlobs(s_binBuf, rw, rh, s_roiBlobs);
 
-  std::vector<RawBlob> aligned;
-  clusterAlignedCharacters(blobs, rw, aligned);
-  if (aligned.size() < 3) return;
+  clusterAlignedCharacters(s_roiBlobs, rw, s_roiAligned);
+  if (s_roiAligned.size() < 3) return;
 
   PlateOcrResult tmp = {};
   tmp.plateLocalized = true;
@@ -1174,25 +1193,25 @@ void evaluateRoiPolarity(const uint8_t *gray,
   tmp.roiW = rw;
   tmp.roiH = rh;
   tmp.usedDarkOnLight = darkOnLight ? 1 : 0;
-  tmp.charCount = static_cast<uint8_t>(aligned.size());
+  tmp.charCount = static_cast<uint8_t>(s_roiAligned.size());
 
   uint32_t confSum = 0;
-  for (size_t i = 0; i < aligned.size(); ++i) {
+  for (size_t i = 0; i < s_roiAligned.size(); ++i) {
     uint8_t conf = 0;
-    char c = classifyCharacterPatch(gray, width, rx, ry, aligned[i], thresh, darkOnLight, conf);
-    tmp.chars[i].x = static_cast<uint16_t>(rx + aligned[i].minX);
-    tmp.chars[i].y = static_cast<uint16_t>(ry + aligned[i].minY);
-    tmp.chars[i].w = static_cast<uint16_t>(aligned[i].maxX - aligned[i].minX + 1);
-    tmp.chars[i].h = static_cast<uint16_t>(aligned[i].maxY - aligned[i].minY + 1);
+    char c = classifyCharacterPatch(gray, width, rx, ry, s_roiAligned[i], thresh, darkOnLight, conf);
+    tmp.chars[i].x = static_cast<uint16_t>(rx + s_roiAligned[i].minX);
+    tmp.chars[i].y = static_cast<uint16_t>(ry + s_roiAligned[i].minY);
+    tmp.chars[i].w = static_cast<uint16_t>(s_roiAligned[i].maxX - s_roiAligned[i].minX + 1);
+    tmp.chars[i].h = static_cast<uint16_t>(s_roiAligned[i].maxY - s_roiAligned[i].minY + 1);
     tmp.chars[i].ch = c;
     tmp.chars[i].confPct = conf;
     tmp.text[i] = c;
     confSum += conf;
   }
-  tmp.text[aligned.size()] = '\0';
-  tmp.avgConfidence = static_cast<uint8_t>(confSum / aligned.size());
+  tmp.text[s_roiAligned.size()] = '\0';
+  tmp.avgConfidence = static_cast<uint8_t>(confSum / s_roiAligned.size());
 
-  int score = static_cast<int>(tmp.avgConfidence) * 4 + static_cast<int>(aligned.size()) * 12;
+  int score = static_cast<int>(tmp.avgConfidence) * 4 + static_cast<int>(s_roiAligned.size()) * 12;
   if (score > bestScore) {
     bestScore = score;
     candidateResult = tmp;
@@ -1236,42 +1255,40 @@ void localizeCandidateRois(const uint8_t *gray,
   int edgeThresh = max(11, (meanEdge * 19) / 10);
 
   // Build binary active block grid and bridge 2-block horizontal gaps between characters
-  std::vector<uint8_t> binGrid(gridCount, 0);
+  memset(s_binGrid, 0, gridCount);
   for (size_t i = 0; i < gridCount; ++i) {
-    if (s_blockMask[i] >= edgeThresh) binGrid[i] = 1;
+    if (s_blockMask[i] >= edgeThresh) s_binGrid[i] = 1;
   }
   for (int by = 1; by < bh - 1; ++by) {
     for (int bx = 1; bx < bw - 3; ++bx) {
       int idx = by * bw + bx;
-      if (binGrid[idx]) {
-        if (binGrid[idx + 2] || binGrid[idx + 3]) {
-          binGrid[idx + 1] = 1;
-          if (binGrid[idx + 3]) binGrid[idx + 2] = 1;
+      if (s_binGrid[idx]) {
+        if (s_binGrid[idx + 2] || s_binGrid[idx + 3]) {
+          s_binGrid[idx + 1] = 1;
+          if (s_binGrid[idx + 3]) s_binGrid[idx + 2] = 1;
         }
       }
     }
   }
 
   // BFS on block grid (ignoring top/bottom 2% borders)
-  std::vector<uint8_t> visited(gridCount, 0);
-  std::vector<int> q;
-  q.reserve(256);
+  memset(s_visited, 0, gridCount);
 
   for (int by = 1; by < bh - 1; ++by) {
     for (int bx = 1; bx < bw - 1; ++bx) {
       int sIdx = by * bw + bx;
-      if (!binGrid[sIdx] || visited[sIdx]) continue;
+      if (!s_binGrid[sIdx] || s_visited[sIdx]) continue;
 
-      q.clear();
-      q.push_back(sIdx);
-      visited[sIdx] = 1;
+      size_t qHead = 0;
+      size_t qTail = 0;
+      s_blockQueue[qTail++] = sIdx;
+      s_visited[sIdx] = 1;
 
       int minBx = bx, maxBx = bx, minBy = by, maxBy = by;
       uint32_t edgeEnergy = 0;
-      size_t qHead = 0;
 
-      while (qHead < q.size()) {
-        int cur = q[qHead++];
+      while (qHead < qTail) {
+        int cur = s_blockQueue[qHead++];
         int cx = cur % bw;
         int cy = cur / bw;
         edgeEnergy += s_blockMask[cur];
@@ -1287,9 +1304,9 @@ void localizeCandidateRois(const uint8_t *gray,
             int ny = cy + dy;
             if (nx < 0 || nx >= bw || ny < 0 || ny >= bh) continue;
             int nIdx = ny * bw + nx;
-            if (binGrid[nIdx] && !visited[nIdx]) {
-              visited[nIdx] = 1;
-              q.push_back(nIdx);
+            if (s_binGrid[nIdx] && !s_visited[nIdx] && qTail < s_blockMaskCap) {
+              s_visited[nIdx] = 1;
+              s_blockQueue[qTail++] = nIdx;
             }
           }
         }
@@ -1369,16 +1386,22 @@ bool plateOcrInit() {
   }
 
   s_blockMaskCap = 80 * 60;
-  s_blockMask = static_cast<uint8_t *>(ps_malloc(s_blockMaskCap));
-  if (!s_blockMask) s_blockMask = static_cast<uint8_t *>(malloc(s_blockMaskCap));
+  s_blockMask = static_cast<uint8_t *>(ocrAllocPsram(s_blockMaskCap));
+  s_binGrid = static_cast<uint8_t *>(ocrAllocPsram(s_blockMaskCap));
+  s_visited = static_cast<uint8_t *>(ocrAllocPsram(s_blockMaskCap));
+  s_blockQueue = static_cast<int32_t *>(ocrAllocPsram(s_blockMaskCap * sizeof(int32_t)));
+  s_binBuf = static_cast<uint8_t *>(ocrAllocPsram(MAX_ROI_PIXELS));
+  s_queueBuf = static_cast<int32_t *>(ocrAllocPsram(MAX_ROI_PIXELS * sizeof(int32_t)));
 
-  s_binBuf = static_cast<uint8_t *>(ps_malloc(MAX_ROI_PIXELS));
-  if (!s_binBuf) s_binBuf = static_cast<uint8_t *>(malloc(MAX_ROI_PIXELS));
+  s_rois.reserve(16);
+  s_roiBlobs.reserve(32);
+  s_roiAligned.reserve(12);
+  s_curCluster.reserve(24);
+  s_bestCluster.reserve(24);
 
-  s_queueBuf = static_cast<int32_t *>(ps_malloc(MAX_ROI_PIXELS * sizeof(int32_t)));
-  if (!s_queueBuf) s_queueBuf = static_cast<int32_t *>(malloc(MAX_ROI_PIXELS * sizeof(int32_t)));
-
-  s_ocrReady = (s_blockMask != nullptr && s_binBuf != nullptr && s_queueBuf != nullptr);
+  s_ocrReady = (s_blockMask != nullptr && s_binGrid != nullptr &&
+                s_visited != nullptr && s_blockQueue != nullptr &&
+                s_binBuf != nullptr && s_queueBuf != nullptr);
   return s_ocrReady;
 }
 
@@ -1393,29 +1416,30 @@ void plateOcrAnalyze(const uint8_t *gray,
     return;
   }
 
-  std::vector<BlockCandidate> rois;
-  localizeCandidateRois(gray, width, height, rois);
-  if (rois.empty()) {
+  localizeCandidateRois(gray, width, height, s_rois);
+  if (s_rois.empty()) {
     return;
   }
 
   // Record best geometric candidate for overlay visualization even if OCR threshold isn't met
   out.plateLocalized = true;
-  out.roiX = rois[0].x0;
-  out.roiY = rois[0].y0;
-  out.roiW = rois[0].x1 - rois[0].x0 + 1;
-  out.roiH = rois[0].y1 - rois[0].y0 + 1;
+  out.roiX = s_rois[0].x0;
+  out.roiY = s_rois[0].y0;
+  out.roiW = s_rois[0].x1 - s_rois[0].x0 + 1;
+  out.roiH = s_rois[0].y1 - s_rois[0].y0 + 1;
 
   int bestScore = -1;
   PlateOcrResult bestCandidate = {};
 
-  for (const auto &roi : rois) {
+  for (const auto &roi : s_rois) {
     int rw = roi.x1 - roi.x0 + 1;
     int rh = roi.y1 - roi.y0 + 1;
     if (rw * rh > MAX_ROI_PIXELS) continue;
-    if (!roiHasContrast(gray, width, roi.x0, roi.y0, rw, rh)) continue;
 
-    uint8_t otsu = computeOtsuThreshold(gray, width, roi.x0, roi.y0, rw, rh);
+    bool hasContrast = false;
+    uint8_t otsu = 128;
+    analyzeRoiStats(gray, width, roi.x0, roi.y0, rw, rh, hasContrast, otsu);
+    if (!hasContrast) continue;
 
     if (polarity == PLATE_POLARITY_AUTO || polarity == PLATE_POLARITY_DARK_ON_LIGHT) {
       evaluateRoiPolarity(gray, width, roi.x0, roi.y0, rw, rh, otsu, true, bestScore, bestCandidate);

@@ -1,0 +1,51 @@
+#pragma once
+
+#include <WebServer.h>
+#include <esp_camera.h>
+#include <stdint.h>
+
+// AI-Thinker ESP32-CAM (HW-297) Pinout
+#if defined(CAMERA_MODEL_AI_THINKER)
+#define CAM_HW_PWDN_GPIO_NUM  32
+#define CAM_HW_RESET_GPIO_NUM -1
+#define CAM_HW_XCLK_GPIO_NUM   0
+#define CAM_HW_SIOD_GPIO_NUM  26
+#define CAM_HW_SIOC_GPIO_NUM  27
+#define CAM_HW_Y9_GPIO_NUM    35
+#define CAM_HW_Y8_GPIO_NUM    34
+#define CAM_HW_Y7_GPIO_NUM    39
+#define CAM_HW_Y6_GPIO_NUM    36
+#define CAM_HW_Y5_GPIO_NUM    21
+#define CAM_HW_Y4_GPIO_NUM    19
+#define CAM_HW_Y3_GPIO_NUM    18
+#define CAM_HW_Y2_GPIO_NUM     5
+#define CAM_HW_VSYNC_GPIO_NUM 25
+#define CAM_HW_HREF_GPIO_NUM  23
+#define CAM_HW_PCLK_GPIO_NUM  22
+#define CAM_HW_FLASH_LED_PIN   4
+#define CAM_HW_STATUS_LED_PIN 33
+#else
+#error "CAMERA_MODEL_AI_THINKER must be defined"
+#endif
+
+void camHwInitLeds();
+void camHwSetStatusLed(bool on);
+void camHwSetFlashLed(uint8_t duty);
+
+bool camHwInitCamera(pixformat_t pixelFormat,
+                     framesize_t frameSize,
+                     int jpegQuality,
+                     bool hmirror,
+                     bool vflip,
+                     int8_t contrast = 0);
+
+void camHwApplySensorSettings(bool hmirror,
+                              bool vflip,
+                              uint8_t flashDuty,
+                              int8_t contrast = 0);
+
+void camHwInitPreview();
+void camHwUpdatePreviewJpeg(const camera_fb_t *fb,
+                            pixformat_t srcFormat,
+                            uint8_t quality = 80);
+void camHwHandlePreviewRequest(WebServer &server);

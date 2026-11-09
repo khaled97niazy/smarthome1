@@ -11,6 +11,7 @@ namespace {
 
 constexpr unsigned long HUB_CONNECT_GRACE_MS = 12000;
 constexpr unsigned long STA_RETRY_INTERVAL_MS = 10000;
+constexpr unsigned long STA_RETRY_FALLBACK_AP_MS = 30000;
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 5000;
 
 const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -22,17 +23,23 @@ bool s_espNowReady = false;
 bool s_hubPeerAdded = false;
 uint8_t s_hubBssid[6] = {0};
 
-bool s_fallbackApActive = false;
+volatile bool s_fallbackApActive = false;
 unsigned long s_bootMs = 0;
 unsigned long s_lastStaAttemptMs = 0;
 unsigned long s_lastHeartbeatMs = 0;
 
 volatile bool s_lastSendOk = false;
+volatile bool s_lastEventSendOk = false;
+volatile bool s_pendingTxIsHeartbeat = true;
 uint32_t s_seq = 0;
-uint32_t s_sentCount = 0;
+volatile uint32_t s_sentCount = 0;
 
 void onEspNowSent(const uint8_t * /*mac_addr*/, esp_now_send_status_t status) {
-  s_lastSendOk = (status == ESP_NOW_SEND_SUCCESS);
+  bool ok = (status == ESP_NOW_SEND_SUCCESS);
+  s_lastSendOk = ok;
+  if (!s_pendingTxIsHeartbeat) {
+    s_lastEventSendOk = ok;
+  }
 }
 
 bool isNonZeroMac(const uint8_t *mac) {
@@ -53,8 +60,7 @@ bool ensurePeer(const uint8_t *mac, wifi_interface_t ifidx) {
   peer.channel = 0; // Use current home channel
   peer.ifidx = ifidx;
   peer.encrypt = false;
-  esp_err_t err = esp_now_add_peer(&peer);
-  return err == ESP_OK;
+  return esp_now_add_peer(&peer) == ESP_OK;
 }
 
 void syncHubPeerLocked() {
@@ -152,17 +158,21 @@ void camNetLoop() {
     return;
   }
 
-  bool connected = (WiFi.status() == WL_CONNECTED);
-  if (connected) {
+  wl_status_t st = WiFi.status();
+  if (st == WL_CONNECTED) {
     stopFallbackApLocked();
     syncHubPeerLocked();
   } else {
     if (!s_fallbackApActive && (now - s_bootMs >= HUB_CONNECT_GRACE_MS)) {
       startFallbackApLocked();
     }
-    if (now - s_lastStaAttemptMs >= STA_RETRY_INTERVAL_MS) {
+    unsigned long retryMs = s_fallbackApActive ? STA_RETRY_FALLBACK_AP_MS : STA_RETRY_INTERVAL_MS;
+    if (now - s_lastStaAttemptMs >= retryMs) {
       s_lastStaAttemptMs = now;
-      WiFi.begin(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS, SmartHomeNet::WIFI_CHANNEL);
+      // Avoid resetting SoftAP HTTP state with full WiFi.begin() while serving fallback clients
+      if (!WiFi.reconnect()) {
+        WiFi.begin(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS, SmartHomeNet::WIFI_CHANNEL);
+      }
     }
   }
 
@@ -194,7 +204,7 @@ bool camNetSendEvent(SmartHomeNet::CamEventType event,
   pkt.source = static_cast<uint8_t>(s_source);
   pkt.event = static_cast<uint8_t>(event);
   pkt.matchId = matchId;
-  pkt.confidence = confidence;
+  pkt.confidence = min<uint8_t>(confidence, 100);
   pkt.seq = ++s_seq;
   if (label) {
     strncpy(pkt.label, label, sizeof(pkt.label) - 1);
@@ -208,11 +218,18 @@ bool camNetSendEvent(SmartHomeNet::CamEventType event,
     ensurePeer(BROADCAST_MAC, WIFI_IF_STA);
   }
 
+  s_pendingTxIsHeartbeat = (event == SmartHomeNet::CAM_EVENT_HEARTBEAT);
   esp_err_t err = esp_now_send(targetMac,
                                reinterpret_cast<const uint8_t *>(&pkt),
                                sizeof(pkt));
+  if (err != ESP_OK && targetMac != BROADCAST_MAC) {
+    ensurePeer(BROADCAST_MAC, WIFI_IF_STA);
+    err = esp_now_send(BROADCAST_MAC,
+                       reinterpret_cast<const uint8_t *>(&pkt),
+                       sizeof(pkt));
+  }
   if (err == ESP_OK && event != SmartHomeNet::CAM_EVENT_HEARTBEAT) {
-    s_sentCount++;
+    s_sentCount = s_sentCount + 1;
   }
 
   if (s_netMutex) {
@@ -230,7 +247,7 @@ bool camNetFallbackApActive() {
 }
 
 bool camNetLastSendOk() {
-  return s_lastSendOk;
+  return (s_sentCount > 0) ? s_lastEventSendOk : s_lastSendOk;
 }
 
 uint32_t camNetSentCount() {
@@ -238,13 +255,17 @@ uint32_t camNetSentCount() {
 }
 
 String camNetIpString() {
+  String out = "0.0.0.0";
+  bool locked = s_netMutex && (xSemaphoreTake(s_netMutex, pdMS_TO_TICKS(10)) == pdTRUE);
   if (WiFi.status() == WL_CONNECTED) {
-    return WiFi.localIP().toString();
+    out = WiFi.localIP().toString();
+  } else if (s_fallbackApActive) {
+    out = WiFi.softAPIP().toString();
   }
-  if (s_fallbackApActive) {
-    return WiFi.softAPIP().toString();
+  if (locked) {
+    xSemaphoreGive(s_netMutex);
   }
-  return String("0.0.0.0");
+  return out;
 }
 
 String camNetFallbackApSsid() {
