@@ -1,7 +1,8 @@
 // Smart Home Camera 1 — On-Device Face Detection & Recognition (HW-297 / ESP32-CAM)
 // Runs 2-stage ESP-DL face detection (MSR01 + MNP01) and MobileFaceNet S8 recognition
 // locally on the ESP32-CAM, persists enrolled faces to the "fr" Flash partition, hosts a
-// management Web UI, and sends wireless ESP-NOW events to the Main ESP32 Hub.
+// real-time MJPEG live streaming and management Web UI, and sends wireless ESP-NOW events
+// to the Main ESP32 Hub.
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -36,6 +37,7 @@ constexpr unsigned long RECOGNIZED_COOLDOWN_MS = 2500;
 constexpr unsigned long UNKNOWN_COOLDOWN_MS = 4000;
 constexpr unsigned long ENROLL_TIMEOUT_MS = 12000;
 constexpr size_t MAX_PENDING_DELETES = 16;
+constexpr uint16_t STREAM_PORT = 81;
 
 struct EnrolledEntry {
   int id;
@@ -56,13 +58,18 @@ struct FaceStatusSnapshot {
   bool modelReady = false;
   bool flashOk = false;
   bool faceDetected = false;
+  char faceQuality[16] = "NO_FACE"; // "READY", "TOO_FAR", "TOO_CLOSE", "OFF_CENTER", "NO_FACE"
+  int faceBox[4] = {0, 0, 0, 0};    // x1, y1, x2, y2
   bool enrollPending = false;
+  uint32_t enrollRemainingMs = 0;
+  char enrollTargetName[24] = "";
   char enrollMessage[64] = "Idle";
   char lastResult[24] = "NONE";
   char lastMatchName[24] = "---";
   int lastMatchId = -1;
   float lastSimilarity = 0.0f;
   uint32_t inferenceMs = 0;
+  float fps = 0.0f;
   uint32_t frameCount = 0;
   int enrolledCount = 0;
   std::vector<EnrolledEntry> enrolled;
@@ -122,11 +129,17 @@ void drawFaceOverlay(camera_fb_t *fb,
     if (x + w > fb->width) w = fb->width - x;
     if (y + h > fb->height) h = fb->height - y;
 
+    // Outer 2px rectangle for clear visibility
     fb_gfx_drawFastHLine(&gfx, x, y, w, color);
+    fb_gfx_drawFastHLine(&gfx, x, y + 1, w, color);
     fb_gfx_drawFastHLine(&gfx, x, y + h - 1, w, color);
+    fb_gfx_drawFastHLine(&gfx, x, y + h - 2, w, color);
     fb_gfx_drawFastVLine(&gfx, x, y, h, color);
+    fb_gfx_drawFastVLine(&gfx, x + 1, y, h, color);
     fb_gfx_drawFastVLine(&gfx, x + w - 1, y, h, color);
+    fb_gfx_drawFastVLine(&gfx, x + w - 2, y, h, color);
 
+    // 5-point facial landmarks (eyes, nose, mouth corners)
     for (size_t j = 0; j + 1 < res.keypoint.size(); j += 2) {
       int kx = constrain(res.keypoint[j], 0, fb->width - 3);
       int ky = constrain(res.keypoint[j + 1], 0, fb->height - 3);
@@ -183,7 +196,7 @@ void sanitizeName(const String &raw, char *out, size_t outSize) {
   size_t pos = 0;
   for (size_t i = 0; i < raw.length() && pos + 1 < outSize; ++i) {
     char c = raw[i];
-    if (isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == ' ') {
+    if (isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == ' ' || c == '(' || c == ')') {
       out[pos++] = c;
     }
   }
@@ -237,16 +250,19 @@ void faceWorkerTask(void * /*param*/) {
   int unknownStreak = 0;
   unsigned long lastRecognizedSentMs = 0;
   unsigned long lastUnknownSentMs = 0;
-  bool discardStaleNext = false;
+
+  uint32_t fpsFrames = 0;
+  unsigned long fpsLastMs = millis();
+  float currentFps = 0.0f;
 
   while (true) {
-    // Service pending commands without holding recognizer across HTTP calls
     std::vector<int> deleteIds;
     bool doClear = false;
     bool doApplyCfg = false;
     bool enrollActive = false;
     uint32_t enrollSeq = 0;
     char enrollTarget[24] = "";
+    uint32_t remainingMs = 0;
 
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
       if (g_clearPending) {
@@ -264,16 +280,23 @@ void faceWorkerTask(void * /*param*/) {
         doApplyCfg = true;
       }
       if (g_enrollPending) {
-        if (millis() - g_enrollStartMs > ENROLL_TIMEOUT_MS) {
+        unsigned long elapsed = millis() - g_enrollStartMs;
+        if (elapsed > ENROLL_TIMEOUT_MS) {
           g_enrollPending = false;
           g_status.enrollPending = false;
+          g_status.enrollRemainingMs = 0;
           snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
                    "Enroll timed out: no face detected");
         } else {
           enrollActive = true;
           enrollSeq = g_enrollSeq;
+          remainingMs = ENROLL_TIMEOUT_MS - elapsed;
+          g_status.enrollRemainingMs = remainingMs;
           snprintf(enrollTarget, sizeof(enrollTarget), "%s", g_enrollName);
+          snprintf(g_status.enrollTargetName, sizeof(g_status.enrollTargetName), "%s", g_enrollName);
         }
+      } else {
+        g_status.enrollRemainingMs = 0;
       }
       xSemaphoreGive(stateMutex);
     }
@@ -316,15 +339,9 @@ void faceWorkerTask(void * /*param*/) {
                     activeCfg.thresh, activeCfg.armed, activeCfg.unknownConfirm, activeCfg.flashDuty);
     }
 
-    if (discardStaleNext) {
-      camera_fb_t *stale = esp_camera_fb_get();
-      if (stale) esp_camera_fb_return(stale);
-      discardStaleNext = false;
-    }
-
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-      vTaskDelay(pdMS_TO_TICKS(50));
+      vTaskDelay(pdMS_TO_TICKS(40));
       continue;
     }
 
@@ -353,12 +370,34 @@ void faceWorkerTask(void * /*param*/) {
     float similarity = 0.0f;
     char matchedName[24] = "---";
     char resultLabel[24] = "NO FACE";
+    char qualityLabel[16] = "NO_FACE";
+    int faceBox[4] = {0, 0, 0, 0};
     bool enrolledNow = false;
     int enrolledNewId = -1;
+    bool enrollAttempted = false;
 
     if (bestFace) {
+      faceBox[0] = constrain(bestFace->box[0], 0, fb->width - 1);
+      faceBox[1] = constrain(bestFace->box[1], 0, fb->height - 1);
+      faceBox[2] = constrain(bestFace->box[2], 0, fb->width - 1);
+      faceBox[3] = constrain(bestFace->box[3], 0, fb->height - 1);
+      int faceCenterX = (faceBox[0] + faceBox[2]) / 2;
+      int faceCenterY = (faceBox[1] + faceBox[3]) / 2;
+
+      if (bestArea < 2400) {
+        strncpy(qualityLabel, "TOO_FAR", sizeof(qualityLabel) - 1);
+      } else if (bestArea > 33000) {
+        strncpy(qualityLabel, "TOO_CLOSE", sizeof(qualityLabel) - 1);
+      } else if (abs(faceCenterX - (fb->width / 2)) > 48 || abs(faceCenterY - (fb->height / 2)) > 48) {
+        strncpy(qualityLabel, "OFF_CENTER", sizeof(qualityLabel) - 1);
+      } else {
+        strncpy(qualityLabel, "READY", sizeof(qualityLabel) - 1);
+      }
+
       std::vector<int> landmarks = bestFace->keypoint;
       if (enrollActive) {
+        // Enroll face with valid landmarks
+        enrollAttempted = true;
         enrolledNewId = recognizer.enroll_id(reinterpret_cast<uint16_t *>(fb->buf),
                                              imgShape,
                                              landmarks,
@@ -373,14 +412,12 @@ void faceWorkerTask(void * /*param*/) {
           similarity = 1.0f;
         }
         unknownStreak = 0;
-        discardStaleNext = true;
       } else {
         face_info_t info = recognizer.recognize(reinterpret_cast<uint16_t *>(fb->buf),
                                                 imgShape,
                                                 landmarks);
         matchedId = info.id;
         similarity = info.similarity;
-        discardStaleNext = true;
 
         unsigned long now = millis();
         uint8_t confPct = static_cast<uint8_t>(constrain(lroundf(similarity * 100.0f), 0L, 100L));
@@ -428,29 +465,38 @@ void faceWorkerTask(void * /*param*/) {
     }
 
     unsigned long elapsedMs = millis() - tStart;
-    if (elapsedMs > 250) {
-      discardStaleNext = true;
-    }
 
     if (!results.empty()) {
       drawFaceOverlay(fb, results, overlayState, enrollActive);
     }
-    camHwUpdatePreviewJpeg(fb, PIXFORMAT_RGB565, 80);
+    camHwUpdatePreviewJpeg(fb, PIXFORMAT_RGB565, 68);
     esp_camera_fb_return(fb);
+
+    // Real-time inference FPS tracking
+    fpsFrames++;
+    unsigned long nowMs = millis();
+    if (nowMs - fpsLastMs >= 1000) {
+      currentFps = (fpsFrames * 1000.0f) / (nowMs - fpsLastMs);
+      fpsFrames = 0;
+      fpsLastMs = nowMs;
+    }
 
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
       g_status.faceDetected = detected;
+      memcpy(g_status.faceBox, faceBox, sizeof(faceBox));
+      strncpy(g_status.faceQuality, qualityLabel, sizeof(g_status.faceQuality) - 1);
       g_status.lastMatchId = matchedId;
       g_status.lastSimilarity = similarity;
       g_status.inferenceMs = static_cast<uint32_t>(elapsedMs);
+      g_status.fps = currentFps;
       g_status.frameCount++;
       snprintf(g_status.lastResult, sizeof(g_status.lastResult), "%s", resultLabel);
       snprintf(g_status.lastMatchName, sizeof(g_status.lastMatchName), "%s", matchedName);
 
-      // Only clear g_enrollPending if no newer /api/enroll arrived while inference ran
-      if (enrollActive && g_enrollSeq == enrollSeq) {
+      if (enrollActive && enrollAttempted && g_enrollSeq == enrollSeq) {
         g_enrollPending = false;
         g_status.enrollPending = false;
+        g_status.enrollRemainingMs = 0;
         if (enrolledNow) {
           snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
                    "Saved \"%s\" as ID #%d in Flash", enrollTarget, enrolledNewId);
@@ -466,7 +512,7 @@ void faceWorkerTask(void * /*param*/) {
       xSemaphoreGive(stateMutex);
     }
 
-    vTaskDelay(pdMS_TO_TICKS(30));
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
@@ -475,153 +521,803 @@ void handleRoot() {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Camera 1 — Face Recognition</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Smart Camera 1 — Face Recognition & Live Stream</title>
 <style>
-  body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:16px}
-  .wrap{max-width:920px;margin:0 auto}
-  h1{font-size:1.35rem;margin:0 0 12px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px}
-  .card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px}
-  img{width:100%;max-width:320px;border-radius:8px;border:1px solid #475569;display:block;margin:0 auto 10px;background:#020617}
-  .row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #334155;font-size:.92rem}
-  .row:last-child{border-bottom:0}
-  .badge{padding:2px 8px;border-radius:999px;font-size:.78rem;font-weight:700}
-  .ok{background:#14532d;color:#86efac}.bad{background:#7f1d1d;color:#fca5a5}.warn{background:#7c2d12;color:#fdba74}.off{background:#334155;color:#cbd5e1}
-  input,select{background:#0f172a;color:#e2e8f0;border:1px solid #475569;border-radius:6px;padding:6px 8px;font-size:.9rem}
-  button{background:#2563eb;color:#fff;border:0;border-radius:7px;padding:7px 12px;font-weight:600;cursor:pointer;font-size:.88rem}
-  button.red{background:#b91c1c}
-  button.gray{background:#475569}
-  button.green{background:#15803d}
-  .formrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}
-  table{width:100%;border-collapse:collapse;margin-top:8px;font-size:.9rem}
-  th,td{padding:6px;border-bottom:1px solid #334155;text-align:left}
+  :root {
+    --bg: #090d16;
+    --card: #131c2e;
+    --card-border: #23324d;
+    --card-hover: #19263e;
+    --text: #f1f5f9;
+    --text-muted: #94a3b8;
+    --primary: #3b82f6;
+    --primary-hover: #2563eb;
+    --success: #10b981;
+    --danger: #ef4444;
+    --warning: #f59e0b;
+    --cyan: #06b6d4;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 16px;
+    line-height: 1.45;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--card-border);
+  }
+  h1 { font-size: 1.25rem; font-weight: 700; margin: 0; display: flex; align-items: center; gap: 8px; }
+  .pulse-dot {
+    width: 10px; height: 10px; border-radius: 50%; background: var(--success);
+    box-shadow: 0 0 10px var(--success); animation: pulse 1.8s infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .4; transform: scale(.85); } }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: var(--radius);
+    padding: 16px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.35);
+  }
+  .card-title {
+    font-size: .95rem; font-weight: 700; color: #cbd5e1;
+    margin: 0 0 12px; display: flex; justify-content: space-between; align-items: center;
+  }
+  
+  /* Video Player Container */
+  .player-box {
+    position: relative;
+    width: 100%;
+    max-width: 420px;
+    margin: 0 auto 12px;
+    border-radius: var(--radius);
+    overflow: hidden;
+    background: #020617;
+    border: 1px solid var(--card-border);
+    aspect-ratio: 1 / 1;
+    box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  }
+  .player-box img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    background: #000;
+  }
+  
+  /* Reticle / Face Guide HUD Overlay */
+  .reticle {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 58%;
+    height: 72%;
+    border-radius: 50% / 60%;
+    border: 2px dashed rgba(148, 163, 184, 0.35);
+    pointer-events: none;
+    transition: all .25s ease;
+  }
+  .reticle.enrolling {
+    border: 3px solid var(--cyan);
+    box-shadow: 0 0 18px rgba(6, 182, 212, 0.45);
+    animation: reticlePulse 1.2s infinite ease-in-out;
+  }
+  .reticle.recognized {
+    border: 3px solid var(--success);
+    box-shadow: 0 0 18px rgba(16, 185, 129, 0.45);
+  }
+  .reticle.unknown {
+    border: 3px solid var(--danger);
+    box-shadow: 0 0 18px rgba(239, 68, 68, 0.45);
+  }
+  @keyframes reticlePulse {
+    0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+    50% { transform: translate(-50%, -50%) scale(1.04); opacity: .7; }
+  }
+
+  /* HUD Badges */
+  .hud-top {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    right: 10px;
+    display: flex;
+    justify-content: space-between;
+    pointer-events: none;
+  }
+  .hud-pill {
+    background: rgba(15, 23, 42, 0.85);
+    backdrop-filter: blur(6px);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 999px;
+    padding: 3px 9px;
+    font-size: .75rem;
+    font-weight: 700;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .hud-bottom {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: linear-gradient(to top, rgba(2, 6, 23, 0.95), rgba(2, 6, 23, 0));
+    padding: 24px 12px 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    pointer-events: none;
+  }
+  .hud-banner-title { font-size: .92rem; font-weight: 700; }
+  .hud-banner-sub { font-size: .75rem; color: var(--text-muted); }
+
+  /* Buttons & Inputs */
+  button {
+    background: var(--primary);
+    color: #fff;
+    border: 0;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: .88rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all .15s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  button:hover { background: var(--primary-hover); transform: translateY(-1px); }
+  button:active { transform: translateY(0); }
+  button.danger { background: var(--danger); }
+  button.danger:hover { background: #dc2626; }
+  button.success { background: var(--success); }
+  button.success:hover { background: #059669; }
+  button.outline {
+    background: transparent;
+    border: 1px solid var(--card-border);
+    color: var(--text-muted);
+  }
+  button.outline:hover { background: var(--card-hover); color: var(--text); }
+  button:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+  
+  input[type="text"], input[type="number"], select {
+    background: #0b1322;
+    color: var(--text);
+    border: 1px solid var(--card-border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: .9rem;
+    width: 100%;
+    outline: none;
+  }
+  input[type="text"]:focus, input[type="number"]:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);
+  }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 7px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    font-size: .88rem;
+  }
+  .row:last-child { border-bottom: 0; }
+  
+  /* Status Badges */
+  .badge {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: .75rem;
+    font-weight: 700;
+    letter-spacing: .3px;
+  }
+  .badge.ok { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.35); }
+  .badge.bad { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.35); }
+  .badge.warn { background: rgba(245, 158, 11, 0.2); color: #fde68a; border: 1px solid rgba(245, 158, 11, 0.35); }
+  .badge.info { background: rgba(6, 182, 212, 0.2); color: #a5f3fc; border: 1px solid rgba(6, 182, 212, 0.35); }
+  .badge.off { background: rgba(148, 163, 184, 0.15); color: #94a3b8; }
+
+  /* Mode selector tabs */
+  .tabs {
+    display: flex;
+    background: #0b1322;
+    border-radius: 8px;
+    padding: 3px;
+    gap: 4px;
+    margin-bottom: 12px;
+    border: 1px solid var(--card-border);
+  }
+  .tab-btn {
+    flex: 1;
+    background: transparent;
+    color: var(--text-muted);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: .8rem;
+    text-align: center;
+    cursor: pointer;
+    border: 0;
+  }
+  .tab-btn.active { background: var(--card); color: #fff; font-weight: 700; box-shadow: 0 2px 6px rgba(0,0,0,.3); }
+
+  /* Progress bar for enrollment */
+  .progress-wrap {
+    height: 8px;
+    background: #0b1322;
+    border-radius: 999px;
+    overflow: hidden;
+    margin: 8px 0;
+    display: none;
+    border: 1px solid var(--card-border);
+  }
+  .progress-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--cyan), var(--primary));
+    transition: width .2s linear;
+  }
+
+  /* Table */
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: .88rem; }
+  th, td { padding: 8px; text-align: left; border-bottom: 1px solid var(--card-border); }
+  th { color: var(--text-muted); font-weight: 600; font-size: .75rem; text-transform: uppercase; }
+  
+  /* Toggle Switch */
+  .switch { position: relative; display: inline-block; width: 42px; height: 22px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+    background-color: #334155; transition: .2s; border-radius: 22px;
+  }
+  .slider:before {
+    position: absolute; content: ""; height: 16px; width: 16px; left: 3px; bottom: 3px;
+    background-color: white; transition: .2s; border-radius: 50%;
+  }
+  input:checked + .slider { background-color: var(--primary); }
+  input:checked + .slider:before { transform: translateX(20px); }
+
+  /* Toast Notification */
+  #toast {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: #1e293b;
+    border: 1px solid var(--card-border);
+    color: #fff;
+    padding: 10px 18px;
+    border-radius: 8px;
+    box-shadow: 0 6px 18px rgba(0,0,0,.5);
+    transform: translateY(100px);
+    opacity: 0;
+    transition: all .25s ease;
+    z-index: 999;
+    font-size: .88rem;
+  }
+  #toast.show { transform: translateY(0); opacity: 1; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>Camera 1 — Local Face Recognition (192.168.4.101)</h1>
+  <header>
+    <h1><span class="pulse-dot"></span> Camera 1 — Face Recognition Live</h1>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span id="hub-badge" class="badge off">CHECKING LINK</span>
+      <span id="fps-badge" class="badge info">0.0 FPS</span>
+    </div>
+  </header>
+
   <div class="grid">
+    <!-- LEFT CARD: LIVE CAMERA & AI OVERLAY -->
     <div class="card">
-      <img id="cam" src="/preview.jpg" alt="Camera Preview">
-      <div class="row"><span>Recognition State</span><span id="res" class="badge off">---</span></div>
-      <div class="row"><span>Identity / Score</span><span id="who">---</span></div>
-      <div class="row"><span>Hub Wireless Link</span><span id="hub" class="badge off">---</span></div>
-      <div class="row"><span>Cycle Time / Flash DB</span><span id="perf">---</span></div>
-      <div class="formrow">
-        <button class="green" onclick="testTrigger(1)">Test Valid Door Open</button>
-        <button class="red" onclick="testTrigger(0)">Test Intruder Siren</button>
+      <div class="card-title">
+        <span>Live Camera View</span>
+        <div style="display:flex;gap:6px">
+          <button class="outline" style="padding:4px 8px;font-size:.78rem" onclick="toggleStreamMode()" id="stream-mode-btn">MJPEG Live</button>
+        </div>
+      </div>
+
+      <div class="player-box" id="player-container">
+        <img id="cam" alt="Camera Live Stream" src="/preview.jpg">
+        <div id="reticle" class="reticle"></div>
+
+        <div class="hud-top">
+          <div class="hud-pill" id="hud-stream-pill">
+            <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--success)"></span>
+            <span id="hud-stream-text">STREAMING :81</span>
+          </div>
+          <div class="hud-pill" id="hud-quality-pill">NO FACE</div>
+        </div>
+
+        <div class="hud-bottom">
+          <div>
+            <div class="hud-banner-title" id="hud-name">---</div>
+            <div class="hud-banner-sub" id="hud-guide">Look towards camera</div>
+          </div>
+          <div style="text-align:right">
+            <div id="hud-match-score" style="font-weight:700;font-size:1.1rem;color:#fff">0%</div>
+            <div style="font-size:.72rem;color:var(--text-muted)" id="hud-ms">0 ms</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Quick LED & Test Controls -->
+      <div class="row">
+        <span>Flash LED Brightness</span>
+        <div style="display:flex;align-items:center;gap:8px;width:55%">
+          <input id="flash-slider" type="range" min="0" max="180" value="0" style="flex:1" oninput="updateFlashPreview(this.value)">
+          <span id="flash-val" style="font-size:.8rem;width:28px;text-align:right">0</span>
+        </div>
+      </div>
+
+      <div class="row">
+        <span>Wireless Link / Storage</span>
+        <span id="status-storage-info" style="font-size:.82rem;color:var(--text-muted)">Flash: OK | ESP-NOW Active</span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">
+        <button class="success" onclick="testDoor(1)" style="justify-content:center">Test Door Open</button>
+        <button class="danger" onclick="testDoor(0)" style="justify-content:center">Test Intruder Siren</button>
       </div>
     </div>
+
+    <!-- RIGHT CARD: USER ADDITION & SAVED FACES -->
     <div class="card">
-      <strong>Enroll New Authorized Face</strong>
-      <p style="font-size:.84rem;color:#94a3b8;margin:4px 0 8px">Look directly at the camera (~40–80 cm), enter a name, then click Enroll.</p>
-      <div class="formrow">
-        <input id="ename" type="text" maxlength="20" placeholder="Name (e.g. Alice)" value="User">
-        <button onclick="enrollFace()">Enroll Next Face</button>
+      <div class="card-title">
+        <span>Authorized Face Enrollment</span>
+        <span id="face-count-badge" class="badge off">0 / 16</span>
       </div>
-      <div id="emsg" style="font-size:.85rem;color:#93c5fd;margin-bottom:10px">Idle</div>
 
-      <div style="display:flex;justify-content:space-between;align-items:center">
-        <strong>Saved Faces in Flash (<span id="ecnt">0</span>)</strong>
-        <button class="red" onclick="clearFaces()">Clear All</button>
+      <!-- Enrollment Flow Tabs -->
+      <div class="tabs">
+        <button class="tab-btn active" id="tab-single" onclick="setEnrollMode('single')">Single Capture</button>
+        <button class="tab-btn" id="tab-multi" onclick="setEnrollMode('multi')">Multi-Angle Guided (3x)</button>
       </div>
-      <table><thead><tr><th>ID</th><th>Name</th><th>Action</th></tr></thead><tbody id="elist"></tbody></table>
 
-      <hr style="border-color:#334155;margin:12px 0">
-      <strong>Settings (Saved to NVS)</strong>
-      <div class="row"><span>Intruder Siren Armed</span><input id="armed" type="checkbox"></div>
-      <div class="row"><span>Match Threshold (0.35–0.80)</span><input id="thresh" type="number" step="0.05" min="0.30" max="0.85" style="width:78px"></div>
-      <div class="row"><span>Unknown Confirm Frames</span><input id="uconf" type="number" min="1" max="5" style="width:78px"></div>
-      <div class="row"><span>Flash LED Brightness (0–180)</span><input id="flash" type="number" min="0" max="180" style="width:78px"></div>
-      <div class="row"><span>Flip Image (H / V)</span><span><label><input id="hmir" type="checkbox"> H</label> <label><input id="vflip" type="checkbox"> V</label></span></div>
-      <div class="formrow"><button onclick="saveCfg()">Save Settings</button></div>
+      <div style="margin-bottom:12px">
+        <label style="font-size:.82rem;color:var(--text-muted);display:block;margin-bottom:4px">Person Name</label>
+        <div style="display:flex;gap:8px">
+          <input id="ename" type="text" maxlength="20" placeholder="e.g. Alice, David" value="User">
+          <button id="enroll-btn" class="primary" onclick="startEnrollment()" style="white-space:nowrap">Enroll Face</button>
+          <button id="cancel-btn" class="danger" onclick="cancelEnrollment()" style="display:none;white-space:nowrap">Cancel</button>
+        </div>
+      </div>
+
+      <!-- Enrollment Progress Bar -->
+      <div class="progress-wrap" id="prog-wrap">
+        <div class="progress-bar" id="prog-bar"></div>
+      </div>
+
+      <div id="enroll-status-banner" style="background:#0b1322;border:1px solid var(--card-border);border-radius:8px;padding:9px 12px;font-size:.84rem;color:#93c5fd;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">
+        <span id="enroll-msg">Idle: Enter name and click Enroll</span>
+        <span id="enroll-timer" style="font-weight:700"></span>
+      </div>
+
+      <!-- Saved Faces Section -->
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px">
+        <span style="font-weight:700;font-size:.9rem">Enrolled Faces in Flash</span>
+        <button class="outline danger" style="padding:4px 8px;font-size:.78rem" onclick="clearAllFaces()">Clear All</button>
+      </div>
+
+      <div style="max-height:220px;overflow-y:auto;margin-top:6px">
+        <table>
+          <thead><tr><th>ID</th><th>Name</th><th style="text-align:right">Action</th></tr></thead>
+          <tbody id="face-table-body">
+            <tr><td colspan="3" style="text-align:center;color:var(--text-muted)">Loading enrolled faces...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <hr style="border:0;border-top:1px solid var(--card-border);margin:16px 0 12px">
+
+      <!-- Settings Collapsible -->
+      <div class="card-title" style="margin-bottom:8px">
+        <span>Security & Camera Settings</span>
+      </div>
+
+      <div class="row">
+        <span>Intruder Siren Armed</span>
+        <label class="switch"><input id="cfg-armed" type="checkbox"><span class="slider"></span></label>
+      </div>
+
+      <div class="row">
+        <span>Similarity Threshold (<span id="thresh-val">0.55</span>)</span>
+        <div style="display:flex;align-items:center;gap:6px;width:55%">
+          <input id="cfg-thresh" type="range" min="0.30" max="0.80" step="0.05" value="0.55" style="flex:1" oninput="document.getElementById('thresh-val').textContent=parseFloat(this.value).toFixed(2)">
+        </div>
+      </div>
+
+      <div class="row">
+        <span>Preset Profiles</span>
+        <div style="display:flex;gap:4px">
+          <button class="outline" style="padding:3px 7px;font-size:.75rem" onclick="setPresetThresh(0.65)">Strict</button>
+          <button class="outline" style="padding:3px 7px;font-size:.75rem" onclick="setPresetThresh(0.55)">Balanced</button>
+          <button class="outline" style="padding:3px 7px;font-size:.75rem" onclick="setPresetThresh(0.45)">Relaxed</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <span>Confirm Frames (Unknown)</span>
+        <input id="cfg-uconf" type="number" min="1" max="5" value="2" style="width:65px">
+      </div>
+
+      <div class="row">
+        <span>Orientation</span>
+        <span>
+          <label style="margin-right:12px"><input id="cfg-hmir" type="checkbox"> Mirror H</label>
+          <label><input id="cfg-vflip" type="checkbox"> Flip V</label>
+        </span>
+      </div>
+
+      <div style="margin-top:10px">
+        <button onclick="saveSettings()" style="width:100%;justify-content:center">Save Settings to NVS</button>
+      </div>
     </div>
   </div>
 </div>
+
+<div id="toast">Settings Saved</div>
+
 <script>
+let currentMode = 'mjpeg'; // 'mjpeg' or 'snapshot'
+let mjpegFails = 0;
+let snapshotActive = false;
+let enrollWizardMode = 'single'; // 'single' or 'multi'
+let multiStep = 0; // 0=front, 1=left, 2=right
+let multiBaseName = '';
 let cfgLoaded = false;
+let clientFrames = 0;
+let lastFpsTs = performance.now();
 let lastListSig = '';
-function refreshImg(){
-  const img = document.getElementById('cam');
-  const nxt = new Image();
-  nxt.onload = ()=>{ img.src = nxt.src; setTimeout(refreshImg, 450); };
-  nxt.onerror = ()=>{ setTimeout(refreshImg, 1200); };
-  nxt.src = '/preview.jpg?t=' + Date.now();
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2600);
 }
-function renderEnrolledTable(list){
-  const sig = list.map(i=>i.id+':'+i.name).join('|');
-  if(sig === lastListSig) return;
+
+// Live Stream Handling
+function initCamera() {
+  const img = document.getElementById('cam');
+  const streamUrl = window.location.protocol + '//' + window.location.hostname + ':81/stream';
+
+  img.onload = () => {
+    clientFrames++;
+    const now = performance.now();
+    if (now - lastFpsTs >= 1000) {
+      const fps = Math.round((clientFrames * 1000) / (now - lastFpsTs) * 10) / 10;
+      document.getElementById('fps-badge').textContent = fps + ' FPS';
+      clientFrames = 0;
+      lastFpsTs = now;
+    }
+  };
+
+  img.onerror = () => {
+    if (currentMode === 'mjpeg') {
+      mjpegFails++;
+      if (mjpegFails >= 2) {
+        console.warn('Switching to fast snapshot polling fallback');
+        setStreamMode('snapshot');
+      }
+    }
+  };
+
+  setStreamMode('mjpeg');
+}
+
+function setStreamMode(mode) {
+  currentMode = mode;
+  const img = document.getElementById('cam');
+  const btn = document.getElementById('stream-mode-btn');
+  const pill = document.getElementById('hud-stream-text');
+
+  if (mode === 'mjpeg') {
+    snapshotActive = false;
+    btn.textContent = 'Mode: MJPEG';
+    pill.textContent = 'STREAMING :81';
+    img.src = window.location.protocol + '//' + window.location.hostname + ':81/stream?t=' + Date.now();
+  } else {
+    btn.textContent = 'Mode: Snapshots';
+    pill.textContent = 'FAST SNAPSHOT';
+    snapshotActive = true;
+    pollNextSnapshot();
+  }
+}
+
+function toggleStreamMode() {
+  setStreamMode(currentMode === 'mjpeg' ? 'snapshot' : 'mjpeg');
+}
+
+function pollNextSnapshot() {
+  if (!snapshotActive || currentMode !== 'snapshot') return;
+  const img = document.getElementById('cam');
+  const next = new Image();
+  next.onload = () => {
+    if (snapshotActive) {
+      img.src = next.src;
+      requestAnimationFrame(pollNextSnapshot);
+    }
+  };
+  next.onerror = () => {
+    if (snapshotActive) setTimeout(pollNextSnapshot, 400);
+  };
+  next.src = '/preview.jpg?t=' + Date.now();
+}
+
+// Flash slider real-time debounce
+let flashTimer = null;
+function updateFlashPreview(val) {
+  document.getElementById('flash-val').textContent = val;
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(async () => {
+    const q = new URLSearchParams({ flash: val });
+    await fetch('/api/config?' + q.toString(), { method: 'POST' });
+  }, 120);
+}
+
+function setPresetThresh(val) {
+  document.getElementById('cfg-thresh').value = val;
+  document.getElementById('thresh-val').textContent = val.toFixed(2);
+}
+
+// Enrollment Mode Switching
+function setEnrollMode(mode) {
+  enrollWizardMode = mode;
+  document.getElementById('tab-single').className = 'tab-btn' + (mode === 'single' ? ' active' : '');
+  document.getElementById('tab-multi').className = 'tab-btn' + (mode === 'multi' ? ' active' : '');
+  multiStep = 0;
+}
+
+async function startEnrollment() {
+  const base = document.getElementById('ename').value.trim() || 'User';
+  multiBaseName = base;
+
+  let targetName = base;
+  if (enrollWizardMode === 'multi') {
+    const labels = ['Front', 'Left 15deg', 'Right 15deg'];
+    targetName = base + ' (' + labels[multiStep] + ')';
+  }
+
+  document.getElementById('enroll-btn').disabled = true;
+  document.getElementById('cancel-btn').style.display = 'inline-flex';
+  document.getElementById('prog-wrap').style.display = 'block';
+
+  await fetch('/api/enroll?name=' + encodeURIComponent(targetName), { method: 'POST' });
+  refreshStatus();
+}
+
+async function cancelEnrollment() {
+  await fetch('/api/enroll/cancel', { method: 'POST' });
+  multiStep = 0;
+  document.getElementById('enroll-btn').disabled = false;
+  document.getElementById('cancel-btn').style.display = 'none';
+  document.getElementById('prog-wrap').style.display = 'none';
+  refreshStatus();
+}
+
+// Polling status & updating UI
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+
+    // Hub link & storage badge
+    const hub = document.getElementById('hub-badge');
+    hub.textContent = d.hubConnected ? ('HUB: ' + d.ip) : (d.fallbackAp ? 'STANDALONE AP' : 'CONNECTING...');
+    hub.className = 'badge ' + (d.hubConnected ? 'ok' : 'warn');
+
+    document.getElementById('status-storage-info').textContent =
+      'Flash DB: ' + (d.flashOk ? 'OK' : 'ERR') + ' | ' + d.enrolledCount + ' Faces Enrolled | Inference: ' + d.inferenceMs + ' ms';
+    document.getElementById('face-count-badge').textContent = d.enrolledCount + ' / 16';
+
+    // Video HUD elements
+    const reticle = document.getElementById('reticle');
+    const qPill = document.getElementById('hud-quality-pill');
+    const nameBanner = document.getElementById('hud-name');
+    const guideBanner = document.getElementById('hud-guide');
+    const scoreBanner = document.getElementById('hud-match-score');
+    document.getElementById('hud-ms').textContent = d.inferenceMs + ' ms';
+
+    // Face Quality guidance
+    if (!d.faceDetected) {
+      qPill.textContent = 'NO FACE';
+      qPill.className = 'hud-pill badge off';
+      reticle.className = 'reticle';
+      guideBanner.textContent = 'Stand 40–70cm directly in front';
+    } else {
+      if (d.faceQuality === 'TOO_FAR') {
+        qPill.textContent = 'MOVE CLOSER';
+        qPill.className = 'hud-pill badge warn';
+        guideBanner.textContent = 'Move closer to the camera';
+      } else if (d.faceQuality === 'TOO_CLOSE') {
+        qPill.textContent = 'STEP BACK';
+        qPill.className = 'hud-pill badge warn';
+        guideBanner.textContent = 'Step back slightly';
+      } else if (d.faceQuality === 'OFF_CENTER') {
+        qPill.textContent = 'CENTER FACE';
+        qPill.className = 'hud-pill badge warn';
+        guideBanner.textContent = 'Position face inside the guide';
+      } else {
+        qPill.textContent = 'PERFECT ALIGNMENT';
+        qPill.className = 'hud-pill badge ok';
+        guideBanner.textContent = 'Hold steady...';
+      }
+    }
+
+    // Recognition result
+    if (d.enrollPending) {
+      reticle.className = 'reticle enrolling';
+      nameBanner.textContent = 'ENROLLING: ' + (d.enrollTargetName || 'User');
+      scoreBanner.textContent = 'CAPTURE';
+      scoreBanner.style.color = 'var(--cyan)';
+    } else if (d.lastResult === 'RECOGNIZED') {
+      reticle.className = 'reticle recognized';
+      nameBanner.textContent = d.lastMatchName;
+      scoreBanner.textContent = Math.round(d.lastSimilarity * 100) + '%';
+      scoreBanner.style.color = 'var(--success)';
+      guideBanner.textContent = 'Identity Verified';
+    } else if (d.lastResult === 'UNKNOWN') {
+      reticle.className = 'reticle unknown';
+      nameBanner.textContent = 'UNKNOWN VISITOR';
+      scoreBanner.textContent = Math.round(d.lastSimilarity * 100) + '%';
+      scoreBanner.style.color = 'var(--danger)';
+      guideBanner.textContent = d.cfg.armed ? 'Intruder Alert Triggered' : 'Unregistered Face';
+    } else {
+      nameBanner.textContent = '---';
+      scoreBanner.textContent = '0%';
+      scoreBanner.style.color = '#fff';
+    }
+
+    // Enrollment card status & countdown
+    const progWrap = document.getElementById('prog-wrap');
+    const progBar = document.getElementById('prog-bar');
+    const enrollBtn = document.getElementById('enroll-btn');
+    const cancelBtn = document.getElementById('cancel-btn');
+    const timerText = document.getElementById('enroll-timer');
+    const msgText = document.getElementById('enroll-msg');
+
+    if (d.enrollPending) {
+      progWrap.style.display = 'block';
+      enrollBtn.disabled = true;
+      cancelBtn.style.display = 'inline-flex';
+      const pct = Math.max(0, Math.min(100, Math.round((d.enrollRemainingMs / 12000) * 100)));
+      progBar.style.width = pct + '%';
+      timerText.textContent = Math.ceil(d.enrollRemainingMs / 1000) + 's';
+      msgText.textContent = d.enrollMessage;
+    } else {
+      progWrap.style.display = 'none';
+      enrollBtn.disabled = false;
+      cancelBtn.style.display = 'none';
+      timerText.textContent = '';
+      msgText.textContent = d.enrollMessage;
+
+      // Check if multi-angle wizard was active and just finished a step
+      if (enrollWizardMode === 'multi' && d.enrollMessage.indexOf('Saved') !== -1 && multiStep < 2) {
+        multiStep++;
+        showToast('Step ' + multiStep + '/3 complete! Preparing next angle...');
+        setTimeout(() => startEnrollment(), 1400);
+      }
+    }
+
+    // Render Enrolled Table
+    renderFaceTable(d.enrolled, d.lastMatchId);
+
+    // Initial config load
+    if (!cfgLoaded && d.cfg) {
+      cfgLoaded = true;
+      document.getElementById('cfg-armed').checked = d.cfg.armed;
+      document.getElementById('cfg-thresh').value = d.cfg.thresh.toFixed(2);
+      document.getElementById('thresh-val').textContent = d.cfg.thresh.toFixed(2);
+      document.getElementById('cfg-uconf').value = d.cfg.unknownConfirm;
+      document.getElementById('flash-slider').value = d.cfg.flashDuty;
+      document.getElementById('flash-val').textContent = d.cfg.flashDuty;
+      document.getElementById('cfg-hmir').checked = d.cfg.hmirror;
+      document.getElementById('cfg-vflip').checked = d.cfg.vflip;
+    }
+  } catch (err) {}
+}
+
+function renderFaceTable(list, activeMatchId) {
+  const sig = list.map(i => i.id + ':' + i.name).join('|') + '@' + activeMatchId;
+  if (sig === lastListSig) return;
   lastListSig = sig;
-  const tb = document.getElementById('elist');
-  tb.textContent = '';
-  list.forEach(item=>{
+
+  const tbody = document.getElementById('face-table-body');
+  tbody.innerHTML = '';
+
+  if (list.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--text-muted);padding:14px">No enrolled faces yet. Add one above!</td></tr>';
+    return;
+  }
+
+  list.forEach(item => {
     const tr = document.createElement('tr');
+    const isCurrent = (item.id === activeMatchId);
+
     const tdId = document.createElement('td');
-    tdId.textContent = '#' + item.id;
+    tdId.innerHTML = '<span class="badge ' + (isCurrent ? 'ok' : 'off') + '">#' + item.id + '</span>';
+
     const tdName = document.createElement('td');
-    tdName.textContent = item.name;
+    tdName.innerHTML = '<strong>' + escapeHtml(item.name) + '</strong>' + (isCurrent ? ' <span style="font-size:.72rem;color:var(--success)">[IN VIEW]</span>' : '');
+
     const tdAct = document.createElement('td');
+    tdAct.style.textAlign = 'right';
     const btn = document.createElement('button');
-    btn.className = 'red';
+    btn.className = 'danger';
+    btn.style.padding = '3px 8px';
+    btn.style.fontSize = '.75rem';
     btn.textContent = 'Delete';
-    btn.addEventListener('click', ()=>delFace(item.id));
+    btn.onclick = () => deleteFace(item.id, item.name);
     tdAct.appendChild(btn);
+
     tr.appendChild(tdId);
     tr.appendChild(tdName);
     tr.appendChild(tdAct);
-    tb.appendChild(tr);
+    tbody.appendChild(tr);
   });
 }
-async function refreshStatus(){
-  try{
-    const r = await fetch('/api/status');
-    const d = await r.json();
-    const resEl = document.getElementById('res');
-    resEl.textContent = d.enrollPending ? 'ENROLLING...' : d.lastResult;
-    resEl.className = 'badge ' + (d.lastResult==='RECOGNIZED'?'ok':(d.lastResult==='UNKNOWN'?'bad':'off'));
-    document.getElementById('who').textContent = d.lastMatchName + ' (' + Math.round(d.lastSimilarity*100) + '%)';
-    const hubEl = document.getElementById('hub');
-    hubEl.textContent = d.hubConnected ? ('CONNECTED ('+d.ip+')') : 'FALLBACK AP';
-    hubEl.className = 'badge ' + (d.hubConnected ? 'ok' : 'warn');
-    document.getElementById('perf').textContent = d.inferenceMs + ' ms | Flash=' + (d.flashOk?'OK':'ERR');
-    document.getElementById('emsg').textContent = d.enrollMessage;
-    document.getElementById('ecnt').textContent = d.enrolledCount;
-    renderEnrolledTable(d.enrolled);
 
-    if(!cfgLoaded){
-      cfgLoaded = true;
-      document.getElementById('armed').checked = d.cfg.armed;
-      document.getElementById('thresh').value = d.cfg.thresh.toFixed(2);
-      document.getElementById('uconf').value = d.cfg.unknownConfirm;
-      document.getElementById('flash').value = d.cfg.flashDuty;
-      document.getElementById('hmir').checked = d.cfg.hmirror;
-      document.getElementById('vflip').checked = d.cfg.vflip;
-    }
-  }catch(e){}
+function escapeHtml(str) {
+  return str.replace(/[&<>'"]/g, tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag] || tag));
 }
-async function enrollFace(){
-  const name = encodeURIComponent(document.getElementById('ename').value || 'User');
-  await fetch('/api/enroll?name=' + name, {method:'POST'});
-  refreshStatus();
+
+async function deleteFace(id, name) {
+  if (confirm('Delete authorized face #' + id + ' ("' + name + '")?')) {
+    await fetch('/api/delete?id=' + id, { method: 'POST' });
+    showToast('Deleted face #' + id);
+    refreshStatus();
+  }
 }
-async function delFace(id){ await fetch('/api/delete?id=' + id, {method:'POST'}); refreshStatus(); }
-async function clearFaces(){ if(confirm('Delete ALL enrolled faces?')){ await fetch('/api/clear', {method:'POST'}); refreshStatus(); } }
-async function saveCfg(){
+
+async function clearAllFaces() {
+  if (confirm('Are you sure you want to delete ALL enrolled faces from Flash storage?')) {
+    await fetch('/api/clear', { method: 'POST' });
+    showToast('All faces cleared');
+    refreshStatus();
+  }
+}
+
+async function saveSettings() {
   const q = new URLSearchParams({
-    armed: document.getElementById('armed').checked ? 1 : 0,
-    thresh: document.getElementById('thresh').value,
-    uconf: document.getElementById('uconf').value,
-    flash: document.getElementById('flash').value,
-    hmir: document.getElementById('hmir').checked ? 1 : 0,
-    vflip: document.getElementById('vflip').checked ? 1 : 0
+    armed: document.getElementById('cfg-armed').checked ? 1 : 0,
+    thresh: document.getElementById('cfg-thresh').value,
+    uconf: document.getElementById('cfg-uconf').value,
+    flash: document.getElementById('flash-slider').value,
+    hmir: document.getElementById('cfg-hmir').checked ? 1 : 0,
+    vflip: document.getElementById('cfg-vflip').checked ? 1 : 0
   });
-  await fetch('/api/config?' + q.toString(), {method:'POST'});
+  await fetch('/api/config?' + q.toString(), { method: 'POST' });
+  showToast('Settings saved to NVS');
   cfgLoaded = false;
   refreshStatus();
 }
-async function testTrigger(ok){ await fetch('/api/test?ok=' + ok, {method:'POST'}); }
-refreshImg(); refreshStatus(); setInterval(refreshStatus, 1000);
+
+async function testDoor(ok) {
+  await fetch('/api/test?ok=' + ok, { method: 'POST' });
+  showToast(ok ? 'Triggered Valid Door Opening' : 'Triggered Intruder Siren Alert');
+}
+
+// Start live systems
+initCamera();
+refreshStatus();
+setInterval(refreshStatus, 800);
 </script>
 </body>
 </html>)HTML";
@@ -646,14 +1342,21 @@ void handleStatus() {
   json += "\"hubConnected\":" + String(camNetHubConnected() ? "true" : "false") + ",";
   json += "\"fallbackAp\":" + String(camNetFallbackApActive() ? "true" : "false") + ",";
   json += "\"ip\":\"" + camNetIpString() + "\",";
+  json += "\"streamPort\":" + String(STREAM_PORT) + ",";
   json += "\"faceDetected\":" + String(snap.faceDetected ? "true" : "false") + ",";
+  json += "\"faceQuality\":\"" + String(snap.faceQuality) + "\",";
+  json += "\"faceBox\":[" + String(snap.faceBox[0]) + "," + String(snap.faceBox[1]) + "," +
+          String(snap.faceBox[2]) + "," + String(snap.faceBox[3]) + "],";
   json += "\"enrollPending\":" + String(snap.enrollPending ? "true" : "false") + ",";
+  json += "\"enrollRemainingMs\":" + String(snap.enrollRemainingMs) + ",";
+  json += "\"enrollTargetName\":\"" + smartHomeJsonEscape(snap.enrollTargetName) + "\",";
   json += "\"enrollMessage\":\"" + smartHomeJsonEscape(snap.enrollMessage) + "\",";
   json += "\"lastResult\":\"" + smartHomeJsonEscape(snap.lastResult) + "\",";
   json += "\"lastMatchName\":\"" + smartHomeJsonEscape(snap.lastMatchName) + "\",";
   json += "\"lastMatchId\":" + String(snap.lastMatchId) + ",";
   json += "\"lastSimilarity\":" + String(snap.lastSimilarity, 3) + ",";
   json += "\"inferenceMs\":" + String(snap.inferenceMs) + ",";
+  json += "\"fps\":" + String(snap.fps, 1) + ",";
   json += "\"frameCount\":" + String(snap.frameCount) + ",";
   json += "\"enrolledCount\":" + String(snap.enrolledCount) + ",";
   json += "\"enrolled\":[";
@@ -671,11 +1374,25 @@ void handleStatus() {
   json += "\"vflip\":" + String(snap.cfg.vflip ? "true" : "false");
   json += "}}";
 
-  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.send(200, "application/json", json);
 }
 
 void handleEnroll() {
+  if (server.hasArg("cancel") && server.arg("cancel") == "1") {
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      g_enrollPending = false;
+      g_status.enrollPending = false;
+      g_status.enrollRemainingMs = 0;
+      snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage), "Enrollment cancelled");
+      xSemaphoreGive(stateMutex);
+      server.send(200, "application/json", "{\"cancelled\":true}");
+    } else {
+      server.send(503, "application/json", "{\"cancelled\":false}");
+    }
+    return;
+  }
+
   String rawName = server.hasArg("name") ? server.arg("name") : String("User");
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     sanitizeName(rawName, g_enrollName, sizeof(g_enrollName));
@@ -683,12 +1400,27 @@ void handleEnroll() {
     g_enrollPending = true;
     g_enrollStartMs = millis();
     g_status.enrollPending = true;
+    g_status.enrollRemainingMs = ENROLL_TIMEOUT_MS;
+    snprintf(g_status.enrollTargetName, sizeof(g_status.enrollTargetName), "%s", g_enrollName);
     snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
-             "Waiting for face to enroll \"%s\"...", g_enrollName);
+             "Looking for face to enroll \"%s\"...", g_enrollName);
     xSemaphoreGive(stateMutex);
     server.send(200, "application/json", "{\"queued\":true}");
   } else {
     server.send(503, "application/json", "{\"queued\":false}");
+  }
+}
+
+void handleEnrollCancel() {
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    g_enrollPending = false;
+    g_status.enrollPending = false;
+    g_status.enrollRemainingMs = 0;
+    snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage), "Enrollment cancelled");
+    xSemaphoreGive(stateMutex);
+    server.send(200, "application/json", "{\"cancelled\":true}");
+  } else {
+    server.send(503, "application/json", "{\"cancelled\":false}");
   }
 }
 
@@ -756,7 +1488,7 @@ void setup() {
 
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== Smart Home Camera 1: Face Recognition (HW-297) ===");
+  Serial.println("\n=== Smart Home Camera 1: Face Recognition & Live Stream (HW-297) ===");
 
   stateMutex = xSemaphoreCreateMutex();
   camHwInitPreview();
@@ -779,10 +1511,23 @@ void setup() {
 
   camNetInit(SmartHomeNet::CAM_SOURCE_FACE);
 
+  // Dedicated real-time MJPEG streaming task on port 81
+  camHwStartStreamServer(STREAM_PORT);
+
+  // HTTP Web Server routes on port 80
   server.on("/", HTTP_GET, handleRoot);
   server.on("/preview.jpg", HTTP_GET, handlePreview);
+  server.on("/stream", HTTP_GET, []() {
+    String host = server.hostHeader();
+    int colon = host.indexOf(':');
+    if (colon > 0) host = host.substring(0, colon);
+    server.sendHeader("Location", "http://" + host + ":81/stream");
+    server.send(302, "text/plain", "Redirecting to :81/stream");
+  });
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/enroll", HTTP_POST, handleEnroll);
+  server.on("/api/enroll/cancel", HTTP_POST, handleEnrollCancel);
+  server.on("/api/enroll/cancel", HTTP_GET, handleEnrollCancel);
   server.on("/api/delete", HTTP_POST, handleDelete);
   server.on("/api/clear", HTTP_POST, handleClear);
   server.on("/api/config", HTTP_POST, handleConfig);
@@ -799,7 +1544,7 @@ void setup() {
                             nullptr,
                             1,
                             nullptr,
-                            1); // Pin to Core 1 (IDLE1 WDT is disabled, Core 0 handles Wi-Fi)
+                            1); // Pin to Core 1 (IDLE1 WDT is disabled, Core 0 handles Wi-Fi + Stream)
   }
 }
 

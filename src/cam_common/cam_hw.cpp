@@ -1,6 +1,8 @@
 #include "cam_hw.h"
 
 #include <Arduino.h>
+#include <WiFiClient.h>
+#include <WiFiServer.h>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -10,11 +12,122 @@
 namespace {
 
 constexpr int FLASH_LEDC_CHANNEL = 2; // Avoid LEDC channel 0 used by camera XCLK
+constexpr int MAX_STREAM_CLIENTS = 2;
 
 SemaphoreHandle_t s_previewMutex = nullptr;
+SemaphoreHandle_t s_newFrameSem = nullptr;
 uint8_t *s_previewJpg = nullptr;
 size_t s_previewJpgLen = 0;
 size_t s_previewJpgCap = 0;
+volatile uint32_t s_previewFrameSeq = 0;
+volatile int s_streamClientCount = 0;
+bool s_streamServerStarted = false;
+
+void camStreamTask(void *pvParameters) {
+  uint16_t port = static_cast<uint16_t>(reinterpret_cast<uintptr_t>(pvParameters));
+  if (port == 0) port = 81;
+  WiFiServer server(port);
+  server.begin();
+  server.setNoDelay(true);
+  Serial.printf("[CAM_STREAM] MJPEG live stream server started on port %u\n", port);
+
+  WiFiClient clients[MAX_STREAM_CLIENTS];
+  uint32_t lastClientSeq[MAX_STREAM_CLIENTS] = {0};
+
+  while (true) {
+    // 1. Accept incoming clients
+    if (server.hasClient()) {
+      WiFiClient newClient = server.available();
+      if (newClient) {
+        newClient.setNoDelay(true);
+        int slot = -1;
+        for (int i = 0; i < MAX_STREAM_CLIENTS; ++i) {
+          if (!clients[i] || !clients[i].connected()) {
+            slot = i;
+            break;
+          }
+        }
+        if (slot >= 0) {
+          if (clients[slot]) {
+            clients[slot].stop();
+          }
+          // Read HTTP request lines
+          unsigned long t0 = millis();
+          while (newClient.connected() && (millis() - t0 < 800)) {
+            if (newClient.available()) {
+              String l = newClient.readStringUntil('\n');
+              if (l == "\r" || l.length() == 0) break;
+            } else {
+              vTaskDelay(pdMS_TO_TICKS(10));
+            }
+          }
+
+          // Send multipart headers
+          newClient.print(
+              "HTTP/1.1 200 OK\r\n"
+              "Content-Type: multipart/x-mixed-replace; boundary=--frame\r\n"
+              "Access-Control-Allow-Origin: *\r\n"
+              "Connection: close\r\n"
+              "Cache-Control: no-cache, no-store, must-revalidate, max-age=0\r\n"
+              "Pragma: no-cache\r\n\r\n");
+
+          clients[slot] = newClient;
+          lastClientSeq[slot] = 0;
+          Serial.printf("[CAM_STREAM] Client slot #%d connected\n", slot);
+        } else {
+          newClient.print("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nBusy\r\n");
+          newClient.stop();
+        }
+      }
+    }
+
+    // 2. Count active clients
+    int activeCount = 0;
+    for (int i = 0; i < MAX_STREAM_CLIENTS; ++i) {
+      if (clients[i] && clients[i].connected()) {
+        activeCount++;
+      } else if (clients[i]) {
+        clients[i].stop();
+      }
+    }
+    s_streamClientCount = activeCount;
+
+    // 3. Wait for new frame signal or timeout
+    if (s_newFrameSem) {
+      xSemaphoreTake(s_newFrameSem, pdMS_TO_TICKS(activeCount > 0 ? 50 : 100));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    // 4. Push frame to connected clients
+    if (activeCount > 0 && s_previewMutex && xSemaphoreTake(s_previewMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+      if (s_previewJpg && s_previewJpgLen > 0) {
+        uint32_t currentSeq = s_previewFrameSeq;
+        for (int i = 0; i < MAX_STREAM_CLIENTS; ++i) {
+          if (!clients[i] || !clients[i].connected()) continue;
+          if (lastClientSeq[i] == currentSeq) continue;
+
+          char partHeader[96];
+          int hlen = snprintf(partHeader, sizeof(partHeader),
+                              "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                              static_cast<unsigned>(s_previewJpgLen));
+
+          size_t w1 = clients[i].write(reinterpret_cast<const uint8_t *>(partHeader), hlen);
+          size_t w2 = clients[i].write(s_previewJpg, s_previewJpgLen);
+          size_t w3 = clients[i].write(reinterpret_cast<const uint8_t *>("\r\n"), 2);
+
+          if (w1 != static_cast<size_t>(hlen) || w2 != s_previewJpgLen || w3 != 2) {
+            clients[i].stop();
+            Serial.printf("[CAM_STREAM] Client slot #%d disconnected on write error\n", i);
+          } else {
+            lastClientSeq[i] = currentSeq;
+          }
+        }
+      }
+      xSemaphoreGive(s_previewMutex);
+    }
+  }
+}
 
 } // namespace
 
@@ -77,10 +190,10 @@ bool camHwInitCamera(pixformat_t pixelFormat,
   config.xclk_freq_hz = 20000000;
   config.pixel_format = pixelFormat;
   config.frame_size = frameSize;
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.jpeg_quality = jpegQuality;
-  config.fb_count = 1;
+  config.fb_count = psramFound() ? 2 : 1;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -101,6 +214,9 @@ void camHwInitPreview() {
   if (!s_previewMutex) {
     s_previewMutex = xSemaphoreCreateMutex();
   }
+  if (!s_newFrameSem) {
+    s_newFrameSem = xSemaphoreCreateBinary();
+  }
 }
 
 void camHwUpdatePreviewJpeg(const camera_fb_t *fb,
@@ -114,22 +230,29 @@ void camHwUpdatePreviewJpeg(const camera_fb_t *fb,
     return;
   }
 
-  if (s_previewMutex && xSemaphoreTake(s_previewMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+  if (s_previewMutex && xSemaphoreTake(s_previewMutex, pdMS_TO_TICKS(40)) == pdTRUE) {
     if (jpgLen > s_previewJpgCap) {
-      uint8_t *newBuf = static_cast<uint8_t *>(ps_realloc(s_previewJpg, jpgLen));
+      size_t newCap = (jpgLen + 8191) & ~4095;
+      if (newCap < 32768) newCap = 32768;
+      uint8_t *newBuf = static_cast<uint8_t *>(ps_realloc(s_previewJpg, newCap));
       if (!newBuf) {
-        newBuf = static_cast<uint8_t *>(realloc(s_previewJpg, jpgLen));
+        newBuf = static_cast<uint8_t *>(realloc(s_previewJpg, newCap));
       }
       if (newBuf) {
         s_previewJpg = newBuf;
-        s_previewJpgCap = jpgLen;
+        s_previewJpgCap = newCap;
       }
     }
     if (s_previewJpg && jpgLen <= s_previewJpgCap) {
       memcpy(s_previewJpg, jpgBuf, jpgLen);
       s_previewJpgLen = jpgLen;
+      s_previewFrameSeq++;
     }
     xSemaphoreGive(s_previewMutex);
+
+    if (s_newFrameSem) {
+      xSemaphoreGive(s_newFrameSem);
+    }
   }
   free(jpgBuf);
 }
@@ -144,9 +267,30 @@ void camHwHandlePreviewRequest(WebServer &server) {
     server.send(503, "text/plain", "Preview not ready");
     return;
   }
-  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
   server.setContentLength(s_previewJpgLen);
   server.send(200, "image/jpeg", "");
   server.sendContent(reinterpret_cast<const char *>(s_previewJpg), s_previewJpgLen);
   xSemaphoreGive(s_previewMutex);
+}
+
+void camHwStartStreamServer(uint16_t port) {
+  if (s_streamServerStarted) return;
+  s_streamServerStarted = true;
+  xTaskCreatePinnedToCore(camStreamTask,
+                          "cam_stream",
+                          4096,
+                          reinterpret_cast<void *>(static_cast<uintptr_t>(port)),
+                          1,
+                          nullptr,
+                          0); // Pin to Core 0 (along with lwIP / WiFi stack)
+}
+
+uint32_t camHwGetPreviewFrameSeq() {
+  return s_previewFrameSeq;
+}
+
+bool camHwHasStreamClients() {
+  return s_streamClientCount > 0;
 }

@@ -11,22 +11,30 @@ A multi-node ESP32 smart home safety and biometric/vehicle access-control system
    - **Car Gate Servos (`GPIO18`, `GPIO19`)**: `0° ↔ 180°` smooth non-blocking PWM ramp, opened exclusively (`5 seconds`) when Camera 2 recognizes an authorized car license plate.
    - **3rd Face Door Servo (`GPIO26`)**: `0° ↔ 180°` smooth non-blocking PWM ramp, opened exclusively (`3 seconds`) when Camera 1 recognizes an enrolled face.
    - **Intruder Siren Pulse**: Triggers a **`4-second`** siren burst (`GPIO25`) whenever either camera reports an unrecognized face or unrecognized license plate.
-   - **Wireless Hub & Dashboard**: Hosts Wi-Fi SoftAP **`SmartHome-Net`** (password `smarthome123`, channel `1`, IP `http://192.168.4.1`) and an ESP-NOW receiver.
+   - **Wireless Hub & Web Admin Panel**: Hosts Wi-Fi SoftAP **`SmartHome-Net`** (password `smarthome123`, channel `1`, IP `http://192.168.4.1`) + optional Home Wi-Fi STA uplink, ESP-NOW receiver, and a **Full Web Admin Dashboard**:
+     - **Live Camera Streams**: Embedded side-by-side viewports for Camera 1 (Face) and Camera 2 (Plate) with live FPS/latency and direct/proxy streaming.
+     - **Sensors & Telemetry**: Dynamic visual gauges and alert badges for Flame (`AO`), Smoke (`MQ-2`), Motion (`PIR`), and Ultrasonic (`HC-SR04`).
+     - **Manual Overrides**: Quick-action controls for Car Gate (open/close), Face Door (unlock/lock), and Siren Alarm (mute/test).
+     - **NVS Settings & Event Log**: Save custom thresholds, timers, and Home Wi-Fi credentials to Flash, and view the live rolling system event log.
 
 2. **Camera 1 — On-Device Face Recognition (`[env:cam_face]`, [`src/cam_face/main.cpp`](src/cam_face/main.cpp))**
    - Runs Espressif ESP-DL **2-stage face detection (`HumanFaceDetectMSR01` + `HumanFaceDetectMNP01`)** + **MobileFaceNet (`FaceRecognition112V1S8`)** 100% locally on the `HW-297` (`240×240` RGB565 in PSRAM).
    - Stores enrolled face embeddings and person names in a dedicated Flash partition (`fr` in [`partitions_cam_face.csv`](partitions_cam_face.csv)) across reboots, plus threshold/settings in NVS Flash.
-   - Hosts a Web UI at **`http://192.168.4.101`** (live face-box preview, enroll with name, delete ID, clear DB, test buttons, calibration).
+   - **Real-Time MJPEG Live Video Stream**: Dedicated FreeRTOS streaming server on **Port 81** (`/stream`) with zero polling, live FPS counter, latency HUD, and face reticle overlay. Automatic fallback to high-speed snapshot pipeline if port 81 is blocked.
+   - **Enhanced Guided Face Enrollment**: Interactive wizard supporting **Single Capture** and **Multi-Angle Guided (3x samples: Front, Left 15°, Right 15°)**, real-time distance and positioning guidance, 12s countdown timer, and instant **Cancel Enrollment** button.
+   - Hosts a Web UI at **`http://192.168.4.101`** (live face-box stream, multi-angle enroll, user list with `[IN VIEW]` badge, delete, clear, test buttons, calibration).
    - **Recognized Face** → ESP-NOW triggers **Door Servo 3 (`GPIO26`)** on the Main Hub.
    - **Unknown Face** (`2` consecutive detections, `4 s` cooldown) → ESP-NOW triggers the **4 s Siren Buzzer (`GPIO25`)**.
 
-3. **Camera 2 — License Plate OCR, QR Code & Barcode Recognition (`[env:cam_plate]` / `[env:cam_plate_qr]`, [`src/cam_plate/`](src/cam_plate/main.cpp))**
+3. **Camera 2 — License Plate OCR, QR Code & Barcode Recognition (`[env:cam_plate]` / `[env:cam_plate_qr]`, [`src/cam_plate/main.cpp`](src/cam_plate/main.cpp))**
    - Runs 100% locally on-device (`320×240` grayscale in PSRAM):
      - **QR Code & 1D Barcode Decoder ([`plate_code.cpp`](src/cam_plate/plate_code.cpp) + PSRAM-backed [`quirc`](src/cam_plate/quirc/))**: Decodes **QR codes** (`quirc`, any rotation), **Code 128** (Sets A/B/C, Mod-103 checksum), and **Code 39** barcodes containing the plate number (e.g. `ABC1234` or `PLATE:ABC1234`).
      - **License Plate OCR Fallback ([`plate_ocr.cpp`](src/cam_plate/plate_ocr.cpp))**: Horizontal edge-energy ROI localization, Otsu adaptive thresholding, 2D connected-component character segmentation, and `16×16` zero-mean NCC template OCR (`0–9`, `A–Z`).
+   - **Real-Time MJPEG Live Video Stream**: Dedicated FreeRTOS streaming server on **Port 81** (`/stream`), real-time FPS badge, and 3:1 aspect plate reticle HUD.
+   - **1-Click Plate Authorization**: Floating HUD action button to instantly authorize any detected plate, QR, or barcode into NVS Flash with a single click.
    - Supports live **Recognition Mode** switching saved to NVS Flash: **`Auto (QR / Barcode → OCR)`** (default in `[env:cam_plate]`), **`QR Code / Barcode Only`** (default in `[env:cam_plate_qr]`), or **`Plate OCR Only`**.
    - Stores up to **20 authorized plate strings** and camera/recognition calibration in NVS Flash across reboots.
-   - Hosts a Web UI at **`http://192.168.4.102`** (live quad/bounding-box preview, `QR CODE` / `BARCODE` / `OCR` source indicator, Add/Delete/Use Last Read plate manager, test buttons, mode/polarity/fuzzy/flash settings).
+   - Hosts a Web UI at **`http://192.168.4.102`** (live quad/bounding-box stream, `QR CODE` / `BARCODE` / `OCR` source indicator, Add/Delete/Use Last Read plate manager with `[IN VIEW]` tracking, test buttons, mode/polarity/fuzzy/flash settings).
    - **Authorized Plate / QR / Barcode** (`2` consecutive valid reads) → ESP-NOW opens the **2-Servo Car Gate (`GPIO18` & `GPIO19`)**.
    - **Unknown Plate / QR / Barcode** (`2` consecutive valid reads, `4 s` cooldown) → ESP-NOW triggers the **4 s Siren Buzzer (`GPIO25`)**.
 
