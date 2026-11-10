@@ -294,3 +294,48 @@ uint32_t camHwGetPreviewFrameSeq() {
 bool camHwHasStreamClients() {
   return s_streamClientCount > 0;
 }
+
+// Estimate mean scene luminance [0,1] from a camera frame buffer.
+// Reads every SAMPLE_STRIDE-th pixel to keep the cost low on the worker core.
+float camHwEstimateMeanLuma(const camera_fb_t *fb) {
+  if (!fb || !fb->buf || fb->len == 0 || fb->width == 0 || fb->height == 0) {
+    return 0.0f;
+  }
+
+  constexpr int SAMPLE_STRIDE = 8;
+  double acc = 0.0;
+  size_t count = 0;
+
+  if (fb->format == PIXFORMAT_GRAYSCALE) {
+    const uint8_t *pix = static_cast<const uint8_t *>(fb->buf);
+    for (int y = 0; y < fb->height; y += SAMPLE_STRIDE) {
+      const uint8_t *row = pix + static_cast<size_t>(y) * fb->width;
+      for (int x = 0; x < fb->width; x += SAMPLE_STRIDE) {
+        acc += row[x];
+        count++;
+      }
+    }
+  } else {
+    // RGB565: 16-bit little-endian pixel = (R<<11)|(G<<5)|B
+    const uint16_t *pix = reinterpret_cast<const uint16_t *>(fb->buf);
+    for (int y = 0; y < fb->height; y += SAMPLE_STRIDE) {
+      const uint16_t *row = pix + static_cast<size_t>(y) * fb->width;
+      for (int x = 0; x < fb->width; x += SAMPLE_STRIDE) {
+        uint16_t px = row[x];
+        uint8_t r = static_cast<uint8_t>((px >> 11) & 0x1F);
+        uint8_t g = static_cast<uint8_t>((px >> 5) & 0x3F);
+        uint8_t b = static_cast<uint8_t>(px & 0x1F);
+        // Expand 5/6-bit channels to 8-bit for luminance.
+        r = static_cast<uint8_t>((r * 255 + 15) / 31);
+        g = static_cast<uint8_t>((g * 255 + 31) / 63);
+        b = static_cast<uint8_t>((b * 255 + 15) / 31);
+        // ITU-R BT.601 luma.
+        acc += 0.299 * r + 0.587 * g + 0.114 * b;
+        count++;
+      }
+    }
+  }
+
+  if (count == 0) return 0.0f;
+  return static_cast<float>(acc / (255.0 * count));
+}

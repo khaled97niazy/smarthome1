@@ -24,6 +24,8 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <SPI.h>
+#include <MFRC522.h>
 #include <esp_now.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
@@ -80,6 +82,24 @@ constexpr unsigned long ULTRASONIC_TIMEOUT_US  = 20000; // ~3.4m timeout
 constexpr int ULTRASONIC_CONFIRM_READS         = 2;
 constexpr unsigned long ULTRASONIC_ALARM_HOLD_MS = 3000;
 constexpr unsigned long CAM_ONLINE_TIMEOUT_MS  = 15000;
+
+// ---------------------------------------------------------------------------
+// RFID Reader (MFRC522 / RC522) on SPI — non-conflicting pins for the Hub
+//   SS/SDA  -> GPIO5   SCK  -> GPIO14   MOSI -> GPIO13   MISO -> GPIO12   RST -> GPIO22
+// ---------------------------------------------------------------------------
+constexpr uint8_t RFID_SS_PIN   = 5;
+constexpr uint8_t RFID_RST_PIN  = 22;
+constexpr uint8_t RFID_SCK_PIN  = 14;
+constexpr uint8_t RFID_MOSI_PIN = 13;
+constexpr uint8_t RFID_MISO_PIN = 12;
+
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+unsigned long lastRfidPrintMs = 0;
+constexpr unsigned long RFID_PRINT_INTERVAL_MS = 2000;
+String lastRfidUid;
+
+// Accepted RFID card UID — triggers the 3rd servo (door) when presented.
+constexpr char ACCEPTED_RFID_UID[] = "52411902";
 
 // ---------------------------------------------------------------------------
 // Persistent Hub Configuration (Stored in NVS "hubcfg")
@@ -1482,6 +1502,11 @@ void setup() {
   buzzerAttached = true;
   ledcWriteTone(SIREN_LEDC_CHANNEL, 0);
 
+  // RFID reader init (MFRC522)
+  SPI.begin(RFID_SCK_PIN, RFID_MISO_PIN, RFID_MOSI_PIN, RFID_SS_PIN);
+  rfid.PCD_Init();
+  Serial.println("[RFID] Reader initialized. Present a card to read its UID.");
+
   // Network initialization
   initHubWiFi();
 
@@ -1533,6 +1558,34 @@ void loop() {
 
   // 4. Update non-blocking ultrasonic sensor
   updateUltrasonicSensor(now);
+
+  // 4b. RFID card reader — print UID to Serial when a new card is presented
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    String uid;
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+      uid += String(rfid.uid.uidByte[i], HEX);
+    }
+    uid.toUpperCase();
+    if (uid != lastRfidUid || (now - lastRfidPrintMs >= RFID_PRINT_INTERVAL_MS)) {
+      lastRfidUid = uid;
+      lastRfidPrintMs = now;
+      Serial.print("[RFID] Card UID: ");
+      Serial.println(uid);
+
+      if (uid == ACCEPTED_RFID_UID) {
+        plateGateUntilMs = now + g_cfg.gateHoldMs;
+        setGateOpen(true);
+        Serial.println("[RFID] Accepted card -> Gate opened (Servos 1 & 2)");
+      } else {
+        camAlarmUntilMs = now + g_cfg.camAlarmMs;
+        startSiren(now);
+        Serial.println("[RFID] Unknown card -> Intruder alarm started");
+      }
+    }
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+  }
 
   // 5. Evaluate camera intruder alert timeout
   bool camAlarmActive = false;

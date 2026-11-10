@@ -1252,12 +1252,14 @@ void setup() {
   loadFromNvs(g_plates, g_cfg);
   bool ocrOk = plateOcrInit();
   bool codeOk = plateCodeInit();
-  bool camOk = camHwInitCamera(PIXFORMAT_GRAYSCALE,
-                               FRAMESIZE_QVGA,
-                               12,
-                               g_cfg.hmirror,
-                               g_cfg.vflip,
-                               1);
+  // Camera disabled — focusing on main board RFID work.
+  // bool camOk = camHwInitCamera(PIXFORMAT_GRAYSCALE,
+  //                              FRAMESIZE_QVGA,
+  //                              12,
+  //                              g_cfg.hmirror,
+  //                              g_cfg.vflip,
+  //                              1);
+  bool camOk = false;
   if (camOk) {
     camHwSetFlashLed(g_cfg.flashDuty);
   }
@@ -1279,7 +1281,7 @@ void setup() {
   camNetInit(SmartHomeNet::CAM_SOURCE_PLATE);
 
   // Dedicated real-time MJPEG streaming task on port 81
-  camHwStartStreamServer(STREAM_PORT);
+  // camHwStartStreamServer(STREAM_PORT);
 
   // HTTP Web Server routes on port 80
   server.on("/", HTTP_GET, handleRoot);
@@ -1301,15 +1303,16 @@ void setup() {
 
   vTaskPrioritySet(nullptr, 2);
 
-  if (camOk && (ocrOk || codeOk)) {
-    xTaskCreatePinnedToCore(plateWorkerTask,
-                            "plate_worker",
-                            16384,
-                            nullptr,
-                            1,
-                            nullptr,
-                            1); // Pin to Core 1 (IDLE1 WDT is disabled, Core 0 handles Wi-Fi + Stream)
-  }
+  // Plate recognition worker disabled (camera off).
+  // if (camOk && (ocrOk || codeOk)) {
+  //   xTaskCreatePinnedToCore(plateWorkerTask,
+  //                           "plate_worker",
+  //                           16384,
+  //                           nullptr,
+  //                           1,
+  //                           nullptr,
+  //                           1); // Pin to Core 1 (IDLE1 WDT is disabled, Core 0 handles Wi-Fi + Stream)
+  // }
 }
 
 void loop() {

@@ -49,6 +49,7 @@ struct FaceConfig {
   int unknownConfirm = 2;
   bool armed = true;
   uint8_t flashDuty = 0;
+  bool flashAuto = true;
   bool hmirror = false;
   bool vflip = false;
 };
@@ -72,6 +73,8 @@ struct FaceStatusSnapshot {
   float fps = 0.0f;
   uint32_t frameCount = 0;
   int enrolledCount = 0;
+  float sceneLuma = 0.0f;
+  uint8_t flashDutyApplied = 0;
   std::vector<EnrolledEntry> enrolled;
   FaceConfig cfg;
 };
@@ -154,6 +157,7 @@ void loadConfigFromNvs(FaceConfig &cfg) {
   cfg.unknownConfirm = prefs.getInt("uconf", 2);
   cfg.armed = prefs.getBool("armed", true);
   cfg.flashDuty = prefs.getUChar("flash", 0);
+  cfg.flashAuto = prefs.getBool("flash_auto", true);
   cfg.hmirror = prefs.getBool("hmir", false);
   cfg.vflip = prefs.getBool("vflip", false);
   prefs.end();
@@ -168,6 +172,7 @@ void saveConfigToNvs(const FaceConfig &cfg) {
   prefs.putInt("uconf", cfg.unknownConfirm);
   prefs.putBool("armed", cfg.armed);
   prefs.putUChar("flash", cfg.flashDuty);
+  prefs.putBool("flash_auto", cfg.flashAuto);
   prefs.putBool("hmir", cfg.hmirror);
   prefs.putBool("vflip", cfg.vflip);
   prefs.end();
@@ -214,6 +219,7 @@ void faceWorkerTask(void * /*param*/) {
     activeCfg = g_status.cfg;
     xSemaphoreGive(stateMutex);
   }
+  uint8_t currentDuty = activeCfg.flashDuty;
 
   HumanFaceDetectMSR01 s1(0.1F, 0.5F, 10, 0.2F);
   HumanFaceDetectMNP01 s2(0.5F, 0.3F, 5);
@@ -254,6 +260,11 @@ void faceWorkerTask(void * /*param*/) {
   uint32_t fpsFrames = 0;
   unsigned long fpsLastMs = millis();
   float currentFps = 0.0f;
+
+  // Auto-flash hysteresis state.
+  bool flashOn = false;
+  // Consecutive empty frame grabs; triggers camera re-init when high.
+  int fbNullStreak = 0;
 
   while (true) {
     std::vector<int> deleteIds;
@@ -341,11 +352,65 @@ void faceWorkerTask(void * /*param*/) {
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
+      fbNullStreak++;
+      if (fbNullStreak >= 25) { // ~1 s of empty grabs -> reinitialize OV2640
+        Serial.println("[FACE] Camera frame grab stalled; re-initializing OV2640...");
+        if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
+          g_status.cameraReady = false;
+          xSemaphoreGive(stateMutex);
+        }
+        esp_camera_deinit();
+        bool camOk = camHwInitCamera(PIXFORMAT_RGB565,
+                                     FRAMESIZE_240X240,
+                                     12,
+                                     activeCfg.hmirror,
+                                     activeCfg.vflip);
+        if (camOk) {
+          camHwSetFlashLed(activeCfg.flashAuto ? (flashOn ? activeCfg.flashDuty : 0)
+                                               : activeCfg.flashDuty);
+        }
+        if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
+          g_status.cameraReady = camOk;
+          xSemaphoreGive(stateMutex);
+        }
+        fbNullStreak = 0;
+      }
       vTaskDelay(pdMS_TO_TICKS(40));
       continue;
     }
+    fbNullStreak = 0;
+    if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
+      g_status.cameraReady = true;
+      xSemaphoreGive(stateMutex);
+    }
 
     unsigned long tStart = millis();
+    float sceneLuma = camHwEstimateMeanLuma(fb);
+
+    // Auto-flash with hysteresis: turn LED on in low light, off when bright.
+    uint8_t duty = activeCfg.flashDuty;
+    if (activeCfg.flashAuto) {
+      if (!flashOn && sceneLuma < 0.18f) {
+        flashOn = true;
+        duty = activeCfg.flashDuty;
+      } else if (flashOn && sceneLuma > 0.40f) {
+        flashOn = false;
+        duty = 0;
+      } else {
+        duty = flashOn ? activeCfg.flashDuty : 0;
+      }
+      if (duty != currentDuty) {
+        camHwSetFlashLed(duty);
+        currentDuty = duty;
+      }
+    } else {
+      flashOn = (activeCfg.flashDuty > 0);
+      if (activeCfg.flashDuty != currentDuty) {
+        camHwSetFlashLed(activeCfg.flashDuty);
+        currentDuty = activeCfg.flashDuty;
+      }
+    }
+
     std::vector<int> imgShape = {static_cast<int>(fb->height), static_cast<int>(fb->width), 3};
     std::list<dl::detect::result_t> &candidates =
         s1.infer(reinterpret_cast<uint16_t *>(fb->buf), imgShape);
@@ -495,6 +560,8 @@ void faceWorkerTask(void * /*param*/) {
       g_status.inferenceMs = static_cast<uint32_t>(elapsedMs);
       g_status.fps = currentFps;
       g_status.frameCount++;
+      g_status.sceneLuma = sceneLuma;
+      g_status.flashDutyApplied = currentDuty;
       snprintf(g_status.lastResult, sizeof(g_status.lastResult), "%s", resultLabel);
       snprintf(g_status.lastMatchName, sizeof(g_status.lastMatchName), "%s", matchedName);
 
@@ -517,7 +584,9 @@ void faceWorkerTask(void * /*param*/) {
       xSemaphoreGive(stateMutex);
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5));
+    // Adaptive yield: short delay while actively recognizing (max throughput but
+    // still lets loopTask run HTTP + heartbeats on Core 1), longer delay when idle.
+    vTaskDelay(pdMS_TO_TICKS(detected || bestFace ? 1 : 5));
   }
 }
 
@@ -869,6 +938,11 @@ void handleRoot() {
           <input id="flash-slider" type="range" min="0" max="180" value="0" style="flex:1" oninput="updateFlashPreview(this.value)">
           <span id="flash-val" style="font-size:.8rem;width:28px;text-align:right">0</span>
         </div>
+      </div>
+
+      <div class="row">
+        <span>Auto Flash in Low Light</span>
+        <label class="switch"><input id="cfg-flash-auto" type="checkbox"><span class="slider"></span></label>
       </div>
 
       <div class="row">
@@ -1233,6 +1307,7 @@ async function refreshStatus() {
       document.getElementById('cfg-uconf').value = d.cfg.unknownConfirm;
       document.getElementById('flash-slider').value = d.cfg.flashDuty;
       document.getElementById('flash-val').textContent = d.cfg.flashDuty;
+      document.getElementById('cfg-flash-auto').checked = d.cfg.flashAuto;
       document.getElementById('cfg-hmir').checked = d.cfg.hmirror;
       document.getElementById('cfg-vflip').checked = d.cfg.vflip;
     }
@@ -1305,6 +1380,7 @@ async function saveSettings() {
     thresh: document.getElementById('cfg-thresh').value,
     uconf: document.getElementById('cfg-uconf').value,
     flash: document.getElementById('flash-slider').value,
+    flash_auto: document.getElementById('cfg-flash-auto').checked ? 1 : 0,
     hmir: document.getElementById('cfg-hmir').checked ? 1 : 0,
     vflip: document.getElementById('cfg-vflip').checked ? 1 : 0
   });
@@ -1363,6 +1439,8 @@ void handleStatus() {
   json += "\"inferenceMs\":" + String(snap.inferenceMs) + ",";
   json += "\"fps\":" + String(snap.fps, 1) + ",";
   json += "\"frameCount\":" + String(snap.frameCount) + ",";
+  json += "\"sceneLuma\":" + String(snap.sceneLuma, 3) + ",";
+  json += "\"flashDutyApplied\":" + String(snap.flashDutyApplied) + ",";
   json += "\"enrolledCount\":" + String(snap.enrolledCount) + ",";
   json += "\"enrolled\":[";
   for (size_t i = 0; i < snap.enrolled.size(); ++i) {
@@ -1375,6 +1453,7 @@ void handleStatus() {
   json += "\"thresh\":" + String(snap.cfg.thresh, 2) + ",";
   json += "\"unknownConfirm\":" + String(snap.cfg.unknownConfirm) + ",";
   json += "\"flashDuty\":" + String(snap.cfg.flashDuty) + ",";
+  json += "\"flashAuto\":" + String(snap.cfg.flashAuto ? "true" : "false") + ",";
   json += "\"hmirror\":" + String(snap.cfg.hmirror ? "true" : "false") + ",";
   json += "\"vflip\":" + String(snap.cfg.vflip ? "true" : "false");
   json += "}}";
@@ -1468,6 +1547,7 @@ void handleConfig() {
     if (server.hasArg("thresh")) next.thresh = constrain(server.arg("thresh").toFloat(), 0.30f, 0.85f);
     if (server.hasArg("uconf")) next.unknownConfirm = constrain(server.arg("uconf").toInt(), 1, 5);
     if (server.hasArg("flash")) next.flashDuty = static_cast<uint8_t>(constrain(server.arg("flash").toInt(), 0, 180));
+    if (server.hasArg("flash_auto")) next.flashAuto = (server.arg("flash_auto").toInt() != 0);
     if (server.hasArg("hmir")) next.hmirror = (server.arg("hmir").toInt() != 0);
     if (server.hasArg("vflip")) next.vflip = (server.arg("vflip").toInt() != 0);
     g_pendingCfg = next;
@@ -1500,13 +1580,15 @@ void setup() {
 
   FaceConfig cfg;
   loadConfigFromNvs(cfg);
-  bool camOk = camHwInitCamera(PIXFORMAT_RGB565,
-                               FRAMESIZE_240X240,
-                               12,
-                               cfg.hmirror,
-                               cfg.vflip);
+  // Camera disabled — focusing on main board RFID work.
+  // bool camOk = camHwInitCamera(PIXFORMAT_RGB565,
+  //                              FRAMESIZE_240X240,
+  //                              12,
+  //                              cfg.hmirror,
+  //                              cfg.vflip);
+  bool camOk = false;
   if (camOk) {
-    camHwSetFlashLed(cfg.flashDuty);
+    camHwSetFlashLed(cfg.flashAuto ? cfg.flashDuty : cfg.flashDuty);
   }
   if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
     g_status.cfg = cfg;
@@ -1517,7 +1599,7 @@ void setup() {
   camNetInit(SmartHomeNet::CAM_SOURCE_FACE);
 
   // Dedicated real-time MJPEG streaming task on port 81
-  camHwStartStreamServer(STREAM_PORT);
+  // camHwStartStreamServer(STREAM_PORT);
 
   // HTTP Web Server routes on port 80
   server.on("/", HTTP_GET, handleRoot);
@@ -1539,18 +1621,23 @@ void setup() {
   server.on("/api/test", HTTP_POST, handleTest);
   server.begin();
 
-  // Elevate loopTask above faceWorkerTask on Core 1 so HTTP + ESP-NOW remain snappy
-  vTaskPrioritySet(nullptr, 2);
+  // Dual-core split: Core 0 = Wi-Fi/lwIP + MJPEG stream (prio 1, set in cam_hw).
+  // Core 1 = face recognition worker (prio 2) + Arduino loop / HTTP + ESP-NOW (prio 1).
+  // Worker runs faster than loopTask so recognition never starves; it yields to
+  // loopTask during blocking frame grabs via vTaskDelay(0)/adaptive delay.
+  vTaskPrioritySet(nullptr, 1);
 
-  if (camOk) {
-    xTaskCreatePinnedToCore(faceWorkerTask,
-                            "face_worker",
-                            16384,
-                            nullptr,
-                            1,
-                            nullptr,
-                            1); // Pin to Core 1 (IDLE1 WDT is disabled, Core 0 handles Wi-Fi + Stream)
-  }
+  // Face recognition worker disabled (camera off).
+  // if (camOk) {
+  //   xTaskCreatePinnedToCore(faceWorkerTask,
+  //                           "face_worker",
+  //                           16384,
+  //                           nullptr,
+  //                           2,
+  //                           nullptr,
+  //                           1); // Pin to Core 1 (Core 0 handles Wi-Fi + Stream)
+  //   Serial.println("Face worker started (Core 1, prio 2). loopTask prio 1.");
+  // }
 }
 
 void loop() {

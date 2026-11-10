@@ -52,3 +52,6 @@ void camHwHandlePreviewRequest(WebServer &server);
 void camHwStartStreamServer(uint16_t port = 81);
 uint32_t camHwGetPreviewFrameSeq();
 bool camHwHasStreamClients();
+
+// Estimate mean scene luminance [0,1] from a camera frame buffer (RGB565 or grayscale).
+float camHwEstimateMeanLuma(const camera_fb_t *fb);
