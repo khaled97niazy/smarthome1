@@ -384,11 +384,16 @@ void faceWorkerTask(void * /*param*/) {
       int faceCenterX = (faceBox[0] + faceBox[2]) / 2;
       int faceCenterY = (faceBox[1] + faceBox[3]) / 2;
 
+      int dx = faceCenterX - static_cast<int>(fb->width / 2);
+      int dy = faceCenterY - static_cast<int>(fb->height / 2);
+      if (dx < 0) dx = -dx;
+      if (dy < 0) dy = -dy;
+
       if (bestArea < 2400) {
         strncpy(qualityLabel, "TOO_FAR", sizeof(qualityLabel) - 1);
       } else if (bestArea > 33000) {
         strncpy(qualityLabel, "TOO_CLOSE", sizeof(qualityLabel) - 1);
-      } else if (abs(faceCenterX - (fb->width / 2)) > 48 || abs(faceCenterY - (fb->height / 2)) > 48) {
+      } else if (dx > 48 || dy > 48) {
         strncpy(qualityLabel, "OFF_CENTER", sizeof(qualityLabel) - 1);
       } else {
         strncpy(qualityLabel, "READY", sizeof(qualityLabel) - 1);
