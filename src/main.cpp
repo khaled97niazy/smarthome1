@@ -29,9 +29,13 @@
 #include <esp_now.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "smart_home_json.h"
 #include "smart_home_protocol.h"
+#include "audio_voice.h"
+#include "mic_i2s.h"
 
 // ---------------------------------------------------------------------------
 // Pin Definitions
@@ -42,6 +46,8 @@ constexpr int PIR_SENSOR_PIN      = 27; // PIR digital OUT (active-HIGH)
 constexpr int ULTRASONIC_TRIG_PIN = 32; // HC-SR04 TRIG (digital OUT)
 constexpr int ULTRASONIC_ECHO_PIN = 33; // HC-SR04 ECHO (digital IN; level shifted 5V->3.3V)
 constexpr int BUZZER_PIN          = 25; // Siren buzzer output (LEDC tone)
+constexpr int AMPLIFIER_PIN       = 4;  // HW-104 PAM8403 Voice Speaker (LEDC PWM Audio)
+constexpr int LIGHT_PIN           = 21; // Smart Light relay / transistor driver (digital OUT)
 constexpr int GATE_SERVO_1_PIN    = 18; // Left car gate servo
 constexpr int GATE_SERVO_2_PIN    = 19; // Right car gate servo
 constexpr int DOOR_SERVO_3_PIN    = 26; // Pedestrian door servo
@@ -55,19 +61,22 @@ constexpr int SERVO_MIN_US        = 500;
 constexpr int SERVO_MAX_US        = 2500;
 
 constexpr int SERVO1_CLOSED_ANGLE = 0;
-constexpr int SERVO1_OPEN_ANGLE   = 180;
+constexpr int SERVO1_OPEN_ANGLE   = 160; // Safety limit (reduced from 180° to avoid binding/stalling)
 constexpr int SERVO2_CLOSED_ANGLE = 0;
-constexpr int SERVO2_OPEN_ANGLE   = 180;
+constexpr int SERVO2_OPEN_ANGLE   = 160; // Safety limit (reduced from 180° to avoid binding/stalling)
 constexpr int DOOR3_CLOSED_ANGLE  = 0;
-constexpr int DOOR3_OPEN_ANGLE    = 180;
+constexpr int DOOR3_OPEN_ANGLE    = 160; // Safety limit (reduced from 180° to avoid binding/stalling)
 
 constexpr int SERVO_STEP_DEG      = 2;
 constexpr unsigned long SERVO_STEP_INTERVAL_MS = 20;
 
 // ---------------------------------------------------------------------------
-// Siren LEDC (Channel 4 avoids conflict with ESP32Servo timers 0-1)
+// Siren & Audio LEDC Channels
+// Timer 2: Channel 4 (Buzzer)
+// Timer 3: Channel 6 (HW-104 Voice Speaker)
 // ---------------------------------------------------------------------------
 constexpr int SIREN_LEDC_CHANNEL  = 4;
+constexpr int AUDIO_LEDC_CHANNEL  = 6;
 constexpr int SIREN_RESOLUTION_BITS = 8;
 constexpr int SIREN_LOW_HZ        = 700;
 constexpr int SIREN_HIGH_HZ       = 1800;
@@ -97,23 +106,33 @@ MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
 unsigned long lastRfidPrintMs = 0;
 constexpr unsigned long RFID_PRINT_INTERVAL_MS = 2000;
 String lastRfidUid;
+bool rfidInitOk = false;
+uint8_t rfidChipVersion = 0;
 
-// Accepted RFID card UID — triggers the 3rd servo (door) when presented.
+// Accepted RFID card UID — triggers the car gate (Servos 1 & 2 to 160°) when presented.
 constexpr char ACCEPTED_RFID_UID[] = "52411902";
 
 // ---------------------------------------------------------------------------
 // Persistent Hub Configuration (Stored in NVS "hubcfg")
 // ---------------------------------------------------------------------------
 struct HubConfig {
-  int fireThreshold        = 500;   // AO drops below this when flame detected
-  int smokeThreshold       = 2000;  // AO rises above this for smoke
+  bool fireTriggersSiren   = true;  // Trigger siren on Flame sensor (can be ignored/bypassed)
+  bool smokeTriggersSiren  = true;  // Trigger siren on MQ-2 Smoke sensor (can be ignored/bypassed)
+  bool motionTriggersSiren = true;  // Trigger buzzer on PIR motion
+  bool ultraTriggersSiren  = true;  // Trigger buzzer on ultrasonic proximity
+  bool sirenMuted          = false; // Global siren mute switch
+  bool fireActiveLow       = true;  // Digital DO active level (LOW = Flame, HIGH = Clean)
+  bool smokeActiveLow      = true;  // Digital DO active level (LOW = Smoke, HIGH = Clean)
+  bool voiceSpokenEnabled  = true;  // Natural spoken voice sentences vs musical chimes
   float ultrasonicDistCm   = 25.0f; // Proximity trigger threshold
   unsigned long gateHoldMs = 5000;  // Duration gate stays open after recognized plate
   unsigned long doorHoldMs = 3000;  // Duration door stays open after recognized face
   unsigned long camAlarmMs = 4000;  // Intruder alarm siren duration
-  bool motionTriggersSiren = true;  // Trigger buzzer on PIR motion
-  bool ultraTriggersSiren  = true;  // Trigger buzzer on ultrasonic proximity
-  bool sirenMuted          = false; // Global siren mute switch
+  bool pirScheduleEnabled  = true;  // Filter PIR siren by night window (midnight to 7 AM)
+  int pirStartHour         = 0;     // Midnight (00:00)
+  int pirStartMin          = 0;
+  int pirEndHour           = 7;     // 7:00 AM (07:00)
+  int pirEndMin            = 0;
   char staSsid[33]         = "";    // Optional Home Wi-Fi SSID
   char staPass[65]         = "";    // Optional Home Wi-Fi Password
 };
@@ -202,13 +221,80 @@ bool lastUltrasonicDetected = false;
 bool gateOpen = false;
 bool doorOpen = false;
 
-int lastFlameAdc = 4095;
-int lastSmokeAdc = 0;
+int lastFlameDigital = 1;
+int lastSmokeDigital = 1;
 bool lastFireDetected = false;
 bool lastSmokeDetected = false;
 bool lastMotionDetected = false;
 bool lastAlarmActive = false;
 unsigned long lastPrintMs = 0;
+
+bool lightState = false;
+bool timeSynchronized = false;
+
+// ---------------------------------------------------------------------------
+// Timekeeping & Smart Lighting Helpers
+// ---------------------------------------------------------------------------
+void initDefaultSystemTime() {
+  struct tm tmBoot = {};
+  tmBoot.tm_year = 2026 - 1900;
+  tmBoot.tm_mon  = 0;  // January
+  tmBoot.tm_mday = 1;
+  tmBoot.tm_hour = 12; // 12:00 PM default as requested
+  tmBoot.tm_min  = 0;
+  tmBoot.tm_sec  = 0;
+  time_t bootEpoch = mktime(&tmBoot);
+  struct timeval tvBoot = { .tv_sec = bootEpoch, .tv_usec = 0 };
+  settimeofday(&tvBoot, nullptr);
+  timeSynchronized = false;
+}
+
+void setSystemEpochTime(uint32_t epochSec) {
+  struct timeval tv = { .tv_sec = static_cast<time_t>(epochSec), .tv_usec = 0 };
+  settimeofday(&tv, nullptr);
+  timeSynchronized = true;
+
+  char timeBuf[32];
+  time_t nowTime = time(nullptr);
+  struct tm ti;
+  localtime_r(&nowTime, &ti);
+  strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", &ti);
+  char msg[72];
+  snprintf(msg, sizeof(msg), "System clock updated to %s", timeBuf);
+  addEventLog("info", msg);
+}
+
+bool isPirScheduleActive() {
+  time_t now = time(nullptr);
+  struct tm ti;
+  localtime_r(&now, &ti);
+  int curMinutes = ti.tm_hour * 60 + ti.tm_min;
+  int startMinutes = g_cfg.pirStartHour * 60 + g_cfg.pirStartMin;
+  int endMinutes = g_cfg.pirEndHour * 60 + g_cfg.pirEndMin;
+
+  if (startMinutes == endMinutes) {
+    return true; // 24-hr active
+  }
+  if (startMinutes < endMinutes) {
+    // Same-day window, e.g. 00:00 (0m) to 07:00 (420m)
+    return (curMinutes >= startMinutes && curMinutes < endMinutes);
+  } else {
+    // Overnight wrap-around window, e.g. 23:00 to 07:00
+    return (curMinutes >= startMinutes || curMinutes < endMinutes);
+  }
+}
+
+void setLightState(bool on) {
+  if (lightState == on) return;
+  lightState = on;
+  digitalWrite(LIGHT_PIN, lightState ? HIGH : LOW);
+  if (g_cfg.voiceSpokenEnabled) {
+    speakSentence(lightState ? VOICE_SENT_LIGHT_ON : VOICE_SENT_LIGHT_OFF);
+  } else {
+    playVoicePrompt(lightState ? VOICE_LIGHT_ON : VOICE_LIGHT_OFF);
+  }
+  addEventLog("info", lightState ? "Smart Light turned ON (GPIO21)" : "Smart Light turned OFF (GPIO21)");
+}
 
 // Non-blocking interrupt-driven HC-SR04 state
 portMUX_TYPE echoMux = portMUX_INITIALIZER_UNLOCKED;
@@ -255,8 +341,11 @@ WebServer server(80);
 // ---------------------------------------------------------------------------
 void loadConfigFromNvs() {
   prefs.begin("hubcfg", true);
-  g_cfg.fireThreshold        = prefs.getInt("fire_th", 500);
-  g_cfg.smokeThreshold       = prefs.getInt("smoke_th", 2000);
+  g_cfg.fireTriggersSiren    = prefs.getBool("fire_siren", true);
+  g_cfg.smokeTriggersSiren   = prefs.getBool("smk_siren", true);
+  g_cfg.fireActiveLow        = prefs.getBool("fire_actlow", true);
+  g_cfg.smokeActiveLow       = prefs.getBool("smk_actlow", true);
+  g_cfg.voiceSpokenEnabled   = prefs.getBool("v_spoken", true);
   g_cfg.ultrasonicDistCm     = prefs.getFloat("ultra_cm", 25.0f);
   g_cfg.gateHoldMs           = prefs.getULong("gate_ms", 5000);
   g_cfg.doorHoldMs           = prefs.getULong("door_ms", 3000);
@@ -264,6 +353,11 @@ void loadConfigFromNvs() {
   g_cfg.motionTriggersSiren  = prefs.getBool("mot_siren", true);
   g_cfg.ultraTriggersSiren   = prefs.getBool("ult_siren", true);
   g_cfg.sirenMuted           = prefs.getBool("muted", false);
+  g_cfg.pirScheduleEnabled  = prefs.getBool("pir_sched", true);
+  g_cfg.pirStartHour         = prefs.getInt("pir_sh", 0);
+  g_cfg.pirStartMin          = prefs.getInt("pir_sm", 0);
+  g_cfg.pirEndHour           = prefs.getInt("pir_eh", 7);
+  g_cfg.pirEndMin            = prefs.getInt("pir_em", 0);
 
   String savedSsid = prefs.getString("sta_ssid", "");
   String savedPass = prefs.getString("sta_pass", "");
@@ -273,18 +367,23 @@ void loadConfigFromNvs() {
   g_cfg.staPass[sizeof(g_cfg.staPass) - 1] = '\0';
   prefs.end();
 
-  g_cfg.fireThreshold = constrain(g_cfg.fireThreshold, 100, 3900);
-  g_cfg.smokeThreshold = constrain(g_cfg.smokeThreshold, 200, 4000);
   g_cfg.ultrasonicDistCm = constrain(g_cfg.ultrasonicDistCm, 5.0f, 150.0f);
   g_cfg.gateHoldMs = constrain(g_cfg.gateHoldMs, 1000UL, 30000UL);
   g_cfg.doorHoldMs = constrain(g_cfg.doorHoldMs, 1000UL, 30000UL);
   g_cfg.camAlarmMs = constrain(g_cfg.camAlarmMs, 1000UL, 20000UL);
+  g_cfg.pirStartHour = constrain(g_cfg.pirStartHour, 0, 23);
+  g_cfg.pirStartMin = constrain(g_cfg.pirStartMin, 0, 59);
+  g_cfg.pirEndHour = constrain(g_cfg.pirEndHour, 0, 23);
+  g_cfg.pirEndMin = constrain(g_cfg.pirEndMin, 0, 59);
 }
 
 void saveConfigToNvs() {
   prefs.begin("hubcfg", false);
-  prefs.putInt("fire_th", g_cfg.fireThreshold);
-  prefs.putInt("smoke_th", g_cfg.smokeThreshold);
+  prefs.putBool("fire_siren", g_cfg.fireTriggersSiren);
+  prefs.putBool("smk_siren", g_cfg.smokeTriggersSiren);
+  prefs.putBool("fire_actlow", g_cfg.fireActiveLow);
+  prefs.putBool("smk_actlow", g_cfg.smokeActiveLow);
+  prefs.putBool("v_spoken", g_cfg.voiceSpokenEnabled);
   prefs.putFloat("ultra_cm", g_cfg.ultrasonicDistCm);
   prefs.putULong("gate_ms", g_cfg.gateHoldMs);
   prefs.putULong("door_ms", g_cfg.doorHoldMs);
@@ -292,6 +391,11 @@ void saveConfigToNvs() {
   prefs.putBool("mot_siren", g_cfg.motionTriggersSiren);
   prefs.putBool("ult_siren", g_cfg.ultraTriggersSiren);
   prefs.putBool("muted", g_cfg.sirenMuted);
+  prefs.putBool("pir_sched", g_cfg.pirScheduleEnabled);
+  prefs.putInt("pir_sh", g_cfg.pirStartHour);
+  prefs.putInt("pir_sm", g_cfg.pirStartMin);
+  prefs.putInt("pir_eh", g_cfg.pirEndHour);
+  prefs.putInt("pir_em", g_cfg.pirEndMin);
   prefs.putString("sta_ssid", g_cfg.staSsid);
   prefs.putString("sta_pass", g_cfg.staPass);
   prefs.end();
@@ -343,7 +447,8 @@ bool popCamPacket(IncomingCamPacket &out) {
 // Servo Helper Functions
 // ---------------------------------------------------------------------------
 int servoAngleToPulseUs(int angle) {
-  int clamped = constrain(angle, 0, 180);
+  // Clamped to 160° maximum to maintain safety margin against motor stall and gear breakage
+  int clamped = constrain(angle, 0, 160);
   long span = static_cast<long>(SERVO_MAX_US - SERVO_MIN_US);
   return SERVO_MIN_US + static_cast<int>((clamped * span + 90L) / 180L);
 }
@@ -372,6 +477,12 @@ void setGateOpen(bool open) {
   targetServo1Angle = gateOpen ? SERVO1_OPEN_ANGLE : SERVO1_CLOSED_ANGLE;
   targetServo2Angle = gateOpen ? SERVO2_OPEN_ANGLE : SERVO2_CLOSED_ANGLE;
   addEventLog("info", gateOpen ? "Car gate opening (Servos 1 & 2)" : "Car gate closing");
+  if (gateOpen) {
+    if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_GATE_OPEN);
+    else playVoicePrompt(VOICE_GATE_OPEN);
+  } else {
+    if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_GATE_CLOSE);
+  }
 }
 
 void setDoorOpen(bool open) {
@@ -379,6 +490,49 @@ void setDoorOpen(bool open) {
   doorOpen = open;
   targetDoor3Angle = doorOpen ? DOOR3_OPEN_ANGLE : DOOR3_CLOSED_ANGLE;
   addEventLog("info", doorOpen ? "Face door unlocked (Servo 3)" : "Face door locked");
+  if (doorOpen) {
+    if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_DOOR_OPEN);
+    else playVoicePrompt(VOICE_DOOR_OPEN);
+  } else {
+    if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_DOOR_CLOSE);
+  }
+}
+
+void onVoiceCommandReceived(VoiceCommand cmd) {
+  char msg[72];
+  snprintf(msg, sizeof(msg), "Voice command executed: %s", voiceCommandName(cmd));
+  addEventLog("info", msg);
+
+  switch (cmd) {
+    case CMD_LIGHT_ON:
+      setLightState(true);
+      break;
+    case CMD_LIGHT_OFF:
+      setLightState(false);
+      break;
+    case CMD_LIGHT_TOGGLE:
+      setLightState(!lightState);
+      break;
+    case CMD_OPEN_DOOR:
+      doorOpenUntilMs = millis() + g_cfg.doorHoldMs;
+      setDoorOpen(true);
+      break;
+    case CMD_OPEN_GATE:
+      plateGateUntilMs = millis() + g_cfg.gateHoldMs;
+      setGateOpen(true);
+      break;
+    case CMD_SIREN_MUTE:
+      g_cfg.sirenMuted = true;
+      saveConfigToNvs();
+      addEventLog("warning", "Siren MUTED by voice command");
+      if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_CONFIRMED);
+      else playVoicePrompt(VOICE_CONFIRMED);
+      break;
+    default:
+      if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_ERROR);
+      else playVoicePrompt(VOICE_ERROR);
+      break;
+  }
 }
 
 void updateAllServos(unsigned long now) {
@@ -539,6 +693,9 @@ void startSiren(unsigned long now) {
   if (buzzerAttached && !g_cfg.sirenMuted) {
     ledcWriteTone(SIREN_LEDC_CHANNEL, sirenHz);
   }
+  if (!g_cfg.sirenMuted) {
+    setVoiceSirenTone(sirenHz);
+  }
   sirenActive = true;
 }
 
@@ -549,6 +706,7 @@ void stopSiren() {
   } else {
     digitalWrite(BUZZER_PIN, LOW);
   }
+  setVoiceSirenTone(0);
   sirenHz = SIREN_LOW_HZ;
   sirenDirection = 1;
   sirenActive = false;
@@ -558,6 +716,7 @@ void updateSiren(unsigned long now) {
   if (!buzzerAttached) return;
   if (g_cfg.sirenMuted) {
     ledcWriteTone(SIREN_LEDC_CHANNEL, 0);
+    setVoiceSirenTone(0);
     return;
   }
   if (now - lastSirenMs < SIREN_STEP_MS) return;
@@ -572,6 +731,7 @@ void updateSiren(unsigned long now) {
     sirenDirection = 1;
   }
   ledcWriteTone(SIREN_LEDC_CHANNEL, sirenHz);
+  setVoiceSirenTone(sirenHz);
 }
 
 const char *eventTypeName(uint8_t ev) {
@@ -595,8 +755,8 @@ void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
     telemetry = &faceCamState;
     srcName = "FACE-CAM";
   } else if (pkt.source == SmartHomeNet::CAM_SOURCE_PLATE) {
-    telemetry = &plateCamState;
-    srcName = "PLATE-CAM";
+    // Car plate camera is disabled; RFID controls the car gate
+    return;
   } else {
     return;
   }
@@ -608,11 +768,26 @@ void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
     return;
   }
 
+  // Deduplicate Dual-Path (ESP-NOW + HTTP POST) deliveries for the same camera event
+  if (telemetry->lastEventMs != 0) {
+    bool sameSeq = (pkt.seq != 0 && pkt.seq == telemetry->lastSeq &&
+                    (now - telemetry->lastEventMs < 2000));
+    bool sameBurst = ((now - telemetry->lastEventMs < 350) &&
+                      telemetry->lastEvent == pkt.event &&
+                      telemetry->lastMatchId == pkt.matchId &&
+                      strncmp(telemetry->lastLabel, pkt.label, sizeof(telemetry->lastLabel)) == 0);
+    if (sameSeq || sameBurst) {
+      return;
+    }
+  }
+
   telemetry->lastEventMs = now;
   telemetry->lastEvent = pkt.event;
   telemetry->lastMatchId = pkt.matchId;
   telemetry->lastConfidence = pkt.confidence;
-  telemetry->lastSeq = pkt.seq;
+  if (pkt.seq != 0) {
+    telemetry->lastSeq = pkt.seq;
+  }
   strncpy(telemetry->lastLabel, pkt.label, sizeof(telemetry->lastLabel) - 1);
   telemetry->lastLabel[sizeof(telemetry->lastLabel) - 1] = '\0';
 
@@ -625,17 +800,13 @@ void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
       snprintf(logMsg, sizeof(logMsg), "Face recognized: \"%s\" (%u%%) -> Door unlocked",
                telemetry->lastLabel, pkt.confidence);
       addEventLog("success", logMsg);
-    } else if (pkt.source == SmartHomeNet::CAM_SOURCE_PLATE) {
-      plateGateUntilMs = now + g_cfg.gateHoldMs;
-      setGateOpen(true);
-      snprintf(logMsg, sizeof(logMsg), "Plate matched: \"%s\" (%u%%) -> Gate opened",
-               telemetry->lastLabel, pkt.confidence);
-      addEventLog("success", logMsg);
     }
   } else if (pkt.event == SmartHomeNet::CAM_EVENT_UNKNOWN) {
     camAlarmUntilMs = now + g_cfg.camAlarmMs;
-    snprintf(logMsg, sizeof(logMsg), "INTRUDER ALERT: Unrecognized %s detected!",
-             (pkt.source == SmartHomeNet::CAM_SOURCE_FACE) ? "face" : "vehicle plate");
+    startSiren(now);
+    if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_ACCESS_DENIED);
+    else playVoicePrompt(VOICE_ERROR);
+    snprintf(logMsg, sizeof(logMsg), "INTRUDER ALERT: Unrecognized face detected!");
     addEventLog("danger", logMsg);
   }
 }
@@ -644,10 +815,21 @@ void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
 // Camera Image Proxy (Forward frames from camera nodes on SoftAP to client)
 // ---------------------------------------------------------------------------
 void handleCamProxy(int camNum) {
-  const char *host = (camNum == 1) ? "192.168.4.101" : "192.168.4.102";
+  if (camNum != 1) {
+    server.send(404, "text/plain", "Plate camera disabled (RFID in use)");
+    return;
+  }
+  unsigned long now = millis();
+  bool faceOnline = faceCamState.seen && (now - faceCamState.lastSeenMs <= CAM_ONLINE_TIMEOUT_MS);
+  if (!faceOnline) {
+    server.send(503, "text/plain", "Face camera offline (no telemetry)");
+    return;
+  }
+
+  const char *host = "192.168.4.101";
   WiFiClient client;
-  if (!client.connect(host, 80, 600)) {
-    server.send(503, "text/plain", "Camera node unreachable");
+  if (!client.connect(host, 80, 200)) {
+    server.send(503, "text/plain", "Face camera unreachable");
     return;
   }
 
@@ -656,12 +838,12 @@ void handleCamProxy(int camNum) {
   client.print("\r\nConnection: close\r\n\r\n");
 
   unsigned long startMs = millis();
-  while (!client.available() && (millis() - startMs < 750)) {
+  while (!client.available() && (millis() - startMs < 250)) {
     delay(5);
   }
   if (!client.available()) {
     client.stop();
-    server.send(504, "text/plain", "Camera response timeout");
+    server.send(504, "text/plain", "Face camera timeout");
     return;
   }
 
@@ -673,7 +855,7 @@ void handleCamProxy(int camNum) {
   }
 
   int contentLength = 0;
-  while (client.connected() && (millis() - startMs < 1100)) {
+  while (client.connected() && (millis() - startMs < 500)) {
     String line = client.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) break; // End of HTTP headers
@@ -696,7 +878,7 @@ void handleCamProxy(int camNum) {
   WiFiClient webClient = server.client();
   uint8_t buf[1024];
   int remaining = contentLength;
-  while (remaining > 0 && client.connected() && (millis() - startMs < 1600)) {
+  while (remaining > 0 && client.connected() && (millis() - startMs < 1200)) {
     int toRead = min(remaining, static_cast<int>(sizeof(buf)));
     int bytesRead = client.read(buf, toRead);
     if (bytesRead > 0) {
@@ -705,8 +887,60 @@ void handleCamProxy(int camNum) {
     } else {
       delay(1);
     }
+    // Keep critical actuators and siren sweep alive during proxy transfers
+    unsigned long curMs = millis();
+    updateAllServos(curMs);
+    updateSiren(curMs);
   }
   client.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Web API: Dual-Path Camera Event Endpoint (/api/cam/event)
+// Receives JSON access control events from camera nodes as an HTTP backup to ESP-NOW
+// ---------------------------------------------------------------------------
+void handleApiCamEvent() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "Missing body");
+    return;
+  }
+  String body = server.arg("plain");
+
+  int source = SmartHomeNet::CAM_SOURCE_FACE;
+  int event = SmartHomeNet::CAM_EVENT_HEARTBEAT;
+  int matchId = -1;
+  int confidence = 100;
+  uint32_t seq = 0;
+  char label[24] = "none";
+
+  int intVal = 0;
+  if (smartHomeJsonGetInt(body, "source", intVal)) source = intVal;
+  if (smartHomeJsonGetInt(body, "event", intVal)) event = intVal;
+  if (smartHomeJsonGetInt(body, "matchId", intVal)) matchId = intVal;
+  if (smartHomeJsonGetInt(body, "confidence", intVal)) confidence = intVal;
+  if (smartHomeJsonGetInt(body, "seq", intVal) && intVal >= 0) seq = static_cast<uint32_t>(intVal);
+  smartHomeJsonGetString(body, "label", label, sizeof(label));
+
+  SmartHomeNet::CamEventPacket pkt = {};
+  pkt.magic = SmartHomeNet::PACKET_MAGIC;
+  pkt.source = static_cast<uint8_t>(source);
+  pkt.event = static_cast<uint8_t>(event);
+  pkt.matchId = static_cast<int16_t>(matchId);
+  pkt.confidence = static_cast<uint8_t>(constrain(confidence, 0, 100));
+  pkt.seq = seq;
+  strncpy(pkt.label, label, sizeof(pkt.label) - 1);
+  pkt.label[sizeof(pkt.label) - 1] = '\0';
+
+  IncomingCamPacket inPkt;
+  inPkt.pkt = pkt;
+  memset(inPkt.srcMac, 0, 6); // HTTP origin
+  handleCamEvent(inPkt, millis());
+
+  server.send(200, "application/json", "{\"status\":\"ok\",\"path\":\"http\"}");
 }
 
 // ---------------------------------------------------------------------------
@@ -718,6 +952,15 @@ void handleApiStatus() {
   bool sirenTestActive = (sirenTestUntilMs != 0 && static_cast<long>(sirenTestUntilMs - now) > 0);
   bool faceOnline = faceCamState.seen && (now - faceCamState.lastSeenMs <= CAM_ONLINE_TIMEOUT_MS);
   bool plateOnline = plateCamState.seen && (now - plateCamState.lastSeenMs <= CAM_ONLINE_TIMEOUT_MS);
+
+  time_t nowClock = time(nullptr);
+  struct tm ti;
+  localtime_r(&nowClock, &ti);
+  char clockStr[32];
+  strftime(clockStr, sizeof(clockStr), "%Y-%m-%d %H:%M:%S", &ti);
+  char timeOnly[16];
+  strftime(timeOnly, sizeof(timeOnly), "%H:%M:%S", &ti);
+  bool pirSchedActive = g_cfg.pirScheduleEnabled ? isPirScheduleActive() : true;
 
   uint32_t droppedSnapshot = 0;
   portENTER_CRITICAL(&rxMux);
@@ -732,10 +975,22 @@ void handleApiStatus() {
   json += "\"uptimeStr\":\"" + String(uptimeBuf) + "\",";
   json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
 
+  // System Time & Smart Light
+  json += "\"lightState\":" + String(lightState ? "true" : "false") + ",";
+  json += "\"pirSchedActive\":" + String(pirSchedActive ? "true" : "false") + ",";
+  json += "\"time\":{";
+  json += "\"clock\":\"" + String(clockStr) + "\",";
+  json += "\"timeOnly\":\"" + String(timeOnly) + "\",";
+  json += "\"epoch\":" + String(nowClock) + ",";
+  json += "\"hour\":" + String(ti.tm_hour) + ",";
+  json += "\"min\":" + String(ti.tm_min) + ",";
+  json += "\"synced\":" + String(timeSynchronized ? "true" : "false");
+  json += "},";
+
   // Safety sensors
-  json += "\"flameAdc\":" + String(lastFlameAdc) + ",";
+  json += "\"flameDigital\":" + String(lastFlameDigital) + ",";
   json += "\"fire\":" + String(lastFireDetected ? "true" : "false") + ",";
-  json += "\"smokeAdc\":" + String(lastSmokeAdc) + ",";
+  json += "\"smokeDigital\":" + String(lastSmokeDigital) + ",";
   json += "\"smoke\":" + String(lastSmokeDetected ? "true" : "false") + ",";
   json += "\"pir\":" + String(lastMotionDetected ? "true" : "false") + ",";
   json += "\"ultra\":" + String(lastUltrasonicDetected ? "true" : "false") + ",";
@@ -774,7 +1029,8 @@ void handleApiStatus() {
           ",\"id\":" + String(faceCamState.lastMatchId) +
           ",\"conf\":" + String(faceCamState.lastConfidence) +
           ",\"label\":\"" + smartHomeJsonEscape(faceCamState.lastLabel) + "\"" +
-          ",\"ageSec\":" + String(faceCamState.seen ? ((now - faceCamState.lastEventMs) / 1000) : 9999) + "},";
+          ",\"ageSec\":" + String(faceCamState.seen ? ((now - faceCamState.lastSeenMs) / 1000) : 9999) +
+          ",\"eventAgeSec\":" + String(faceCamState.lastEventMs > 0 ? ((now - faceCamState.lastEventMs) / 1000) : 9999) + "},";
 
   json += "\"plateCam\":{\"online\":" + String(plateOnline ? "true" : "false") +
           ",\"event\":\"" + String(eventTypeName(plateCamState.lastEvent)) + "\"" +
@@ -783,16 +1039,48 @@ void handleApiStatus() {
           ",\"label\":\"" + smartHomeJsonEscape(plateCamState.lastLabel) + "\"" +
           ",\"ageSec\":" + String(plateCamState.seen ? ((now - plateCamState.lastEventMs) / 1000) : 9999) + "},";
 
+  // RFID Telemetry
+  json += "\"rfid\":{";
+  json += "\"lastUid\":\"" + lastRfidUid + "\",";
+  json += "\"acceptedUid\":\"" + String(ACCEPTED_RFID_UID) + "\",";
+  json += "\"lastScanSec\":" + String(lastRfidPrintMs > 0 ? ((now - lastRfidPrintMs) / 1000) : 9999);
+  json += "},";
+
+  // Voice Audio & Microphone Telemetry
+  json += "\"mic\":{";
+  json += "\"online\":" + String(isMicOnline() ? "true" : "false") + ",";
+  json += "\"rms\":" + String(getMicRmsLevel()) + ",";
+  json += "\"peak\":" + String(getMicPeakLevel()) + ",";
+  json += "\"db\":" + String(getMicRmsDb()) + ",";
+  json += "\"vad\":" + String(isVoiceActivityDetected() ? "true" : "false") + ",";
+  json += "\"recording\":" + String(isMicLoopbackRecording() ? "true" : "false") + ",";
+  json += "\"recProgress\":" + String(getMicLoopbackProgressPct());
+  json += "},";
+
+  json += "\"speaker\":{";
+  json += "\"pin\":" + String(AMPLIFIER_PIN) + ",";
+  json += "\"playing\":" + String(isVoicePlaying() ? "true" : "false") + ",";
+  json += "\"current\":\"" + smartHomeJsonEscape(getVoiceCurrentText()) + "\"";
+  json += "},";
+
   // Active Configuration
   json += "\"cfg\":{";
-  json += "\"fireTh\":" + String(g_cfg.fireThreshold) + ",";
-  json += "\"smokeTh\":" + String(g_cfg.smokeThreshold) + ",";
+  json += "\"voiceSpoken\":" + String(g_cfg.voiceSpokenEnabled ? "true" : "false") + ",";
+  json += "\"fireSiren\":" + String(g_cfg.fireTriggersSiren ? "true" : "false") + ",";
+  json += "\"smokeSiren\":" + String(g_cfg.smokeTriggersSiren ? "true" : "false") + ",";
+  json += "\"fireActLow\":" + String(g_cfg.fireActiveLow ? "true" : "false") + ",";
+  json += "\"smokeActLow\":" + String(g_cfg.smokeActiveLow ? "true" : "false") + ",";
   json += "\"ultraCm\":" + String(g_cfg.ultrasonicDistCm, 1) + ",";
   json += "\"gateMs\":" + String(g_cfg.gateHoldMs) + ",";
   json += "\"doorMs\":" + String(g_cfg.doorHoldMs) + ",";
   json += "\"camMs\":" + String(g_cfg.camAlarmMs) + ",";
   json += "\"motSiren\":" + String(g_cfg.motionTriggersSiren ? "true" : "false") + ",";
-  json += "\"ultSiren\":" + String(g_cfg.ultraTriggersSiren ? "true" : "false");
+  json += "\"ultSiren\":" + String(g_cfg.ultraTriggersSiren ? "true" : "false") + ",";
+  json += "\"pirSched\":" + String(g_cfg.pirScheduleEnabled ? "true" : "false") + ",";
+  json += "\"pirSH\":" + String(g_cfg.pirStartHour) + ",";
+  json += "\"pirSM\":" + String(g_cfg.pirStartMin) + ",";
+  json += "\"pirEH\":" + String(g_cfg.pirEndHour) + ",";
+  json += "\"pirEM\":" + String(g_cfg.pirEndMin);
   json += "},";
 
   // Event log items
@@ -860,6 +1148,81 @@ void handleApiControl() {
       addEventLog("info", "Siren buzzer UNMUTED by user");
     }
     saveConfigToNvs();
+  } else if (action == "light_on") {
+    setLightState(true);
+  } else if (action == "light_off") {
+    setLightState(false);
+  } else if (action == "light_toggle") {
+    setLightState(!lightState);
+  } else if (action == "voice_prompt") {
+    String prompt = server.arg("prompt");
+    if (prompt == "light_on") playVoicePrompt(VOICE_LIGHT_ON);
+    else if (prompt == "light_off") playVoicePrompt(VOICE_LIGHT_OFF);
+    else if (prompt == "door_open") playVoicePrompt(VOICE_DOOR_OPEN);
+    else if (prompt == "gate_open") playVoicePrompt(VOICE_GATE_OPEN);
+    else if (prompt == "confirmed") playVoicePrompt(VOICE_CONFIRMED);
+    else if (prompt == "error") playVoicePrompt(VOICE_ERROR);
+    else if (prompt == "siren") playVoicePrompt(VOICE_SIREN_PULSE);
+    else {
+      server.send(400, "application/json", "{\"error\":\"unknown prompt\"}");
+      return;
+    }
+    addEventLog("info", ("Audio voice prompt tested: " + prompt).c_str());
+  } else if (action == "speak_sentence") {
+    String tag = server.arg("sentence");
+    VoiceSentenceId id = getVoiceSentenceIdByTag(tag.c_str());
+    if (id != VOICE_SENT_NONE) {
+      speakSentence(id);
+      addEventLog("info", (String("Spoken sentence tested: \"") + getVoiceSentenceLabel(id) + "\"").c_str());
+    } else {
+      server.send(400, "application/json", "{\"error\":\"unknown sentence tag\"}");
+      return;
+    }
+  } else if (action == "voice_stop") {
+    stopVoicePrompt();
+    addEventLog("info", "Speaker audio playback stopped");
+  } else if (action == "mic_loopback") {
+    bool ok = startMicLoopbackTest(2000);
+    if (ok) {
+      addEventLog("warning", "Mic loopback test: Recording 2s via INMP441...");
+    } else {
+      addEventLog("danger", "Mic loopback test: Busy or Mic offline");
+    }
+  } else if (action == "toggle_sensor_alarm") {
+    String sensor = server.arg("sensor");
+    if (sensor == "fire") {
+      g_cfg.fireTriggersSiren = !g_cfg.fireTriggersSiren;
+      addEventLog(g_cfg.fireTriggersSiren ? "info" : "warning",
+                  g_cfg.fireTriggersSiren ? "Flame alarm ARMED (triggers siren)" : "Flame alarm BYPASSED / IGNORED");
+    } else if (sensor == "smoke") {
+      g_cfg.smokeTriggersSiren = !g_cfg.smokeTriggersSiren;
+      addEventLog(g_cfg.smokeTriggersSiren ? "info" : "warning",
+                  g_cfg.smokeTriggersSiren ? "MQ-2 Smoke alarm ARMED (triggers siren)" : "MQ-2 Smoke alarm BYPASSED / IGNORED");
+    } else if (sensor == "motion") {
+      g_cfg.motionTriggersSiren = !g_cfg.motionTriggersSiren;
+      addEventLog(g_cfg.motionTriggersSiren ? "info" : "warning",
+                  g_cfg.motionTriggersSiren ? "Motion alarm ARMED" : "Motion alarm BYPASSED / IGNORED");
+    } else if (sensor == "ultra") {
+      g_cfg.ultraTriggersSiren = !g_cfg.ultraTriggersSiren;
+      addEventLog(g_cfg.ultraTriggersSiren ? "info" : "warning",
+                  g_cfg.ultraTriggersSiren ? "Ultrasonic alarm ARMED" : "Ultrasonic alarm BYPASSED / IGNORED");
+    } else {
+      server.send(400, "application/json", "{\"error\":\"unknown sensor\"}");
+      return;
+    }
+    saveConfigToNvs();
+  } else if (action == "sim_voice") {
+    String cmdStr = server.arg("cmd");
+    if (cmdStr == "light_on") dispatchVoiceCommand(CMD_LIGHT_ON);
+    else if (cmdStr == "light_off") dispatchVoiceCommand(CMD_LIGHT_OFF);
+    else if (cmdStr == "light_toggle") dispatchVoiceCommand(CMD_LIGHT_TOGGLE);
+    else if (cmdStr == "open_door") dispatchVoiceCommand(CMD_OPEN_DOOR);
+    else if (cmdStr == "open_gate") dispatchVoiceCommand(CMD_OPEN_GATE);
+    else if (cmdStr == "siren_mute") dispatchVoiceCommand(CMD_SIREN_MUTE);
+    else {
+      server.send(400, "application/json", "{\"error\":\"unknown voice command\"}");
+      return;
+    }
   } else {
     server.send(400, "application/json", "{\"error\":\"unknown action\"}");
     return;
@@ -869,17 +1232,62 @@ void handleApiControl() {
 }
 
 // ---------------------------------------------------------------------------
+// Web API: Set System Clock (/api/time)
+// ---------------------------------------------------------------------------
+void handleApiTime() {
+  if (server.hasArg("epoch")) {
+    int64_t ep = atoll(server.arg("epoch").c_str());
+    if (server.hasArg("tz_offset")) {
+      ep += server.arg("tz_offset").toInt();
+    }
+    setSystemEpochTime(static_cast<uint32_t>(ep));
+    server.send(200, "application/json", "{\"ok\":true,\"synced\":true}");
+    return;
+  }
+  if (server.hasArg("hour") && server.hasArg("min")) {
+    time_t now = time(nullptr);
+    struct tm ti;
+    localtime_r(&now, &ti);
+    ti.tm_hour = constrain(server.arg("hour").toInt(), 0, 23);
+    ti.tm_min  = constrain(server.arg("min").toInt(), 0, 59);
+    ti.tm_sec  = server.hasArg("sec") ? constrain(server.arg("sec").toInt(), 0, 59) : 0;
+    if (server.hasArg("year")) {
+      ti.tm_year = constrain(server.arg("year").toInt() - 1900, 70, 200);
+    }
+    if (server.hasArg("mon")) {
+      ti.tm_mon = constrain(server.arg("mon").toInt() - 1, 0, 11);
+    }
+    if (server.hasArg("mday")) {
+      ti.tm_mday = constrain(server.arg("mday").toInt(), 1, 31);
+    }
+    time_t newEpoch = mktime(&ti);
+    setSystemEpochTime(static_cast<uint32_t>(newEpoch));
+    server.send(200, "application/json", "{\"ok\":true,\"synced\":true}");
+    return;
+  }
+  server.send(400, "application/json", "{\"error\":\"missing epoch or time parameters\"}");
+}
+
+// ---------------------------------------------------------------------------
 // Web API: Update Settings (/api/config)
 // ---------------------------------------------------------------------------
 void handleApiConfig() {
-  if (server.hasArg("fire_th"))  g_cfg.fireThreshold = constrain(server.arg("fire_th").toInt(), 100, 3900);
-  if (server.hasArg("smoke_th")) g_cfg.smokeThreshold = constrain(server.arg("smoke_th").toInt(), 200, 4000);
-  if (server.hasArg("ultra_cm")) g_cfg.ultrasonicDistCm = constrain(server.arg("ultra_cm").toFloat(), 5.0f, 150.0f);
-  if (server.hasArg("gate_ms"))  g_cfg.gateHoldMs = constrain(server.arg("gate_ms").toInt(), 1000, 30000);
-  if (server.hasArg("door_ms"))  g_cfg.doorHoldMs = constrain(server.arg("door_ms").toInt(), 1000, 30000);
-  if (server.hasArg("cam_ms"))   g_cfg.camAlarmMs = constrain(server.arg("cam_ms").toInt(), 1000, 20000);
-  if (server.hasArg("mot_siren")) g_cfg.motionTriggersSiren = (server.arg("mot_siren").toInt() != 0);
-  if (server.hasArg("ult_siren")) g_cfg.ultraTriggersSiren = (server.arg("ult_siren").toInt() != 0);
+  if (server.hasArg("fire_siren"))  g_cfg.fireTriggersSiren = (server.arg("fire_siren").toInt() != 0);
+  if (server.hasArg("smoke_siren")) g_cfg.smokeTriggersSiren = (server.arg("smoke_siren").toInt() != 0);
+  if (server.hasArg("fire_actlow")) g_cfg.fireActiveLow = (server.arg("fire_actlow").toInt() != 0);
+  if (server.hasArg("smoke_actlow")) g_cfg.smokeActiveLow = (server.arg("smoke_actlow").toInt() != 0);
+  if (server.hasArg("voice_spoken")) g_cfg.voiceSpokenEnabled = (server.arg("voice_spoken").toInt() != 0);
+  if (server.hasArg("ultra_cm"))    g_cfg.ultrasonicDistCm = constrain(server.arg("ultra_cm").toFloat(), 5.0f, 150.0f);
+  if (server.hasArg("gate_ms"))     g_cfg.gateHoldMs = constrain(server.arg("gate_ms").toInt(), 1000, 30000);
+  if (server.hasArg("door_ms"))     g_cfg.doorHoldMs = constrain(server.arg("door_ms").toInt(), 1000, 30000);
+  if (server.hasArg("cam_ms"))      g_cfg.camAlarmMs = constrain(server.arg("cam_ms").toInt(), 1000, 20000);
+  if (server.hasArg("mot_siren"))   g_cfg.motionTriggersSiren = (server.arg("mot_siren").toInt() != 0);
+  if (server.hasArg("ult_siren"))   g_cfg.ultraTriggersSiren = (server.arg("ult_siren").toInt() != 0);
+  if (server.hasArg("pir_sched"))   g_cfg.pirScheduleEnabled = (server.arg("pir_sched").toInt() != 0);
+  if (server.hasArg("pir_sh"))      g_cfg.pirStartHour = constrain(server.arg("pir_sh").toInt(), 0, 23);
+  if (server.hasArg("pir_sm"))      g_cfg.pirStartMin  = constrain(server.arg("pir_sm").toInt(), 0, 59);
+  if (server.hasArg("pir_eh"))      g_cfg.pirEndHour   = constrain(server.arg("pir_eh").toInt(), 0, 23);
+  if (server.hasArg("pir_em"))      g_cfg.pirEndMin    = constrain(server.arg("pir_em").toInt(), 0, 59);
 
   saveConfigToNvs();
   addEventLog("info", "System settings updated and saved to NVS");
@@ -1028,6 +1436,8 @@ void handleRoot() {
       </div>
     </div>
     <div class="h-status">
+      <span id="sysClockBadge" class="badge b-warn" style="font-family:monospace;font-size:.8rem">12:00:00 PM</span>
+      <button class="secondary" style="font-size:.76rem;padding:4px 8px" onclick="syncBrowserTime()" title="Sync clock with browser">⏱️ Sync Time</button>
       <span id="badgeAlarm" class="badge b-ok">SYSTEM NORMAL</span>
       <span id="badgeMute" class="badge b-off">SIREN ARMED</span>
       <button id="btnMute" class="secondary" onclick="toggleMute()">Mute Siren</button>
@@ -1062,27 +1472,24 @@ void handleRoot() {
       </div>
     </div>
 
-    <!-- Camera 2: Car Plate OCR -->
+    <!-- RFID Car Gate Access Control (Replaces Plate Cam) -->
     <div class="card">
       <div class="card-title">
-        <span>Camera 2: License Plate OCR (HW-297)</span>
-        <span id="cam2Status" class="badge b-off">CONNECTING...</span>
+        <span>🚗 RFID Car Gate Access (MFRC522)</span>
+        <span id="rfidStatus" class="badge b-ok">ACTIVE</span>
       </div>
-      <div class="cam-box">
-        <img id="cam2Img" class="cam-img" alt="Camera 2 License Plate Stream">
-        <div class="cam-overlay">
-          <span id="cam2Tag" class="badge b-off">SCANNING</span>
-          <span id="cam2Fps" style="background:rgba(0,0,0,0.6);padding:2px 6px;border-radius:4px;font-size:.72rem">-- ms</span>
-        </div>
+      <div class="rfid-box" style="padding:16px 12px;text-align:center;background:#0d1527;border-radius:8px;margin-bottom:12px;border:1px dashed #23324d">
+        <div style="font-size:1.8rem;margin-bottom:4px">💳</div>
+        <div style="font-size:.82rem;color:var(--muted)">Present RFID card to open Car Gate (Servos 1&amp;2 to 160°)</div>
+        <div style="margin-top:8px;font-family:monospace;font-size:1.15rem;font-weight:700;color:#06b6d4" id="rfidUidText">NO CARD SCANNED</div>
       </div>
       <div class="cam-meta">
-        <div class="row"><span class="k">Detected Plate</span><span id="cam2Plate" class="v">---</span></div>
-        <div class="row"><span class="k">Link / Last Seen</span><span id="cam2Link" class="v">---</span></div>
+        <div class="row"><span class="k">Accepted Card UID</span><span id="rfidAccepted" class="v" style="font-family:monospace">52411902</span></div>
+        <div class="row"><span class="k">Last Scan Activity</span><span id="rfidLastSeen" class="v">---</span></div>
       </div>
       <div class="cam-actions">
         <button onclick="triggerAction('gate_open')">🚗 Open Car Gate (Servos 1&amp;2)</button>
         <button class="secondary" onclick="triggerAction('gate_close')">⛔ Close Gate</button>
-        <a id="cam2LinkBtn" class="btn secondary" href="http://192.168.4.102/" target="_blank">Open Plate UI ↗</a>
       </div>
     </div>
   </div>
@@ -1090,26 +1497,30 @@ void handleRoot() {
   <!-- Sensors & Safety Telemetry -->
   <div class="card-title" style="margin-bottom:8px">⚡ Environmental & Access Sensors</div>
   <div class="grid">
-    <!-- Flame Sensor -->
+    <!-- Flame Sensor (Digital DO on GPIO34) -->
     <div class="card">
       <div class="card-title">
         <span>🔥 Flame Sensor (GPIO34)</span>
         <span id="flameBadge" class="badge b-ok">SAFE</span>
       </div>
-      <div class="row"><span class="k">Raw ADC (Drops on Fire)</span><span id="flameVal" class="v">---</span></div>
-      <div class="row"><span class="k">Alarm Threshold</span><span id="flameThText" class="v">&le; 500</span></div>
-      <div class="bar-bg"><div id="flameBar" class="bar-fill" style="width:0%"></div></div>
+      <div class="row"><span class="k">Digital Signal (DO)</span><span id="flameVal" class="v">HIGH (Safe)</span></div>
+      <div class="row"><span class="k">Siren Alarm Link</span><span id="flameSirenBadge" class="badge b-ok">ARMED</span></div>
+      <div style="margin-top:10px">
+        <button id="btnToggleFlameAlarm" class="secondary" style="width:100%;font-size:.78rem;padding:6px" onclick="triggerAction('toggle_sensor_alarm&sensor=fire')">🔕 Ignore Flame Alarm</button>
+      </div>
     </div>
 
-    <!-- Smoke MQ-2 Sensor -->
+    <!-- Smoke MQ-2 Sensor (Digital DO on GPIO35) -->
     <div class="card">
       <div class="card-title">
         <span>💨 Smoke MQ-2 (GPIO35)</span>
         <span id="smokeBadge" class="badge b-ok">CLEAN</span>
       </div>
-      <div class="row"><span class="k">Raw Gas/Smoke ADC</span><span id="smokeVal" class="v">---</span></div>
-      <div class="row"><span class="k">Alarm Threshold</span><span id="smokeThText" class="v">&ge; 2000</span></div>
-      <div class="bar-bg"><div id="smokeBar" class="bar-fill" style="width:0%"></div></div>
+      <div class="row"><span class="k">Digital Signal (DO)</span><span id="smokeVal" class="v">HIGH (Clean)</span></div>
+      <div class="row"><span class="k">Siren Alarm Link</span><span id="smokeSirenBadge" class="badge b-ok">ARMED</span></div>
+      <div style="margin-top:10px">
+        <button id="btnToggleSmokeAlarm" class="secondary" style="width:100%;font-size:.78rem;padding:6px" onclick="triggerAction('toggle_sensor_alarm&sensor=smoke')">🔕 Ignore Smoke Alarm</button>
+      </div>
     </div>
 
     <!-- PIR Motion Sensor -->
@@ -1119,8 +1530,11 @@ void handleRoot() {
         <span id="pirBadge" class="badge b-ok">CLEAR</span>
       </div>
       <div class="row"><span class="k">Motion State</span><span id="pirVal" class="v">No Motion</span></div>
-      <div class="row"><span class="k">Siren Response</span><span id="pirCfgText" class="v">Enabled</span></div>
-      <div style="font-size:.82rem;color:var(--muted);margin-top:6px">Active-HIGH digital infrared sensor</div>
+      <div class="row"><span class="k">Siren Guard Window</span><span id="pirWindowText" class="v">00:00 - 07:00</span></div>
+      <div class="row"><span class="k">Night Siren Guard</span><span id="pirGuardBadge" class="badge b-off">QUIET HOURS</span></div>
+      <div style="margin-top:8px">
+        <button id="btnTogglePirAlarm" class="secondary" style="width:100%;font-size:.78rem;padding:6px" onclick="triggerAction('toggle_sensor_alarm&sensor=motion')">🔕 Ignore Motion Alarm</button>
+      </div>
     </div>
 
     <!-- Ultrasonic Proximity -->
@@ -1130,13 +1544,115 @@ void handleRoot() {
         <span id="ultraBadge" class="badge b-ok">CLEAR</span>
       </div>
       <div class="row"><span class="k">Obstacle Distance</span><span id="ultraVal" class="v">---</span></div>
-      <div class="row"><span class="k">Proximity Threshold</span><span id="ultraThText" class="v">&le; 25.0 cm</span></div>
+      <div class="row"><span class="k">Siren Alarm Link</span><span id="ultraSirenBadge" class="badge b-ok">ARMED</span></div>
       <div class="bar-bg"><div id="ultraBar" class="bar-fill" style="width:0%"></div></div>
+      <div style="margin-top:8px">
+        <button id="btnToggleUltraAlarm" class="secondary" style="width:100%;font-size:.78rem;padding:6px" onclick="triggerAction('toggle_sensor_alarm&sensor=ultra')">🔕 Ignore Range Alarm</button>
+      </div>
+    </div>
     </div>
   </div>
 
   <!-- Actuators & Hardware State -->
   <div class="grid">
+    <!-- Smart Lighting (GPIO21) -->
+    <div class="card">
+      <div class="card-title">
+        <span>💡 Smart Lighting</span>
+        <span id="lightBadge" class="badge b-off">LIGHT OFF</span>
+      </div>
+      <div class="row"><span class="k">Output Control</span><span class="v">GPIO 21 (Relay / Transistor)</span></div>
+      <div class="row"><span class="k">Current State</span><span id="lightStateText" class="v">OFF (0V)</span></div>
+      <div class="cam-actions" style="margin-top:10px">
+        <button id="btnLightToggle" onclick="triggerAction('light_toggle')">Toggle Light</button>
+        <button class="secondary" onclick="triggerAction('light_on')">Turn ON</button>
+        <button class="secondary" onclick="triggerAction('light_off')">Turn OFF</button>
+      </div>
+    </div>
+
+    <!-- Voice Assistant, Speaker & Microphone Test Studio -->
+    <div class="card" style="grid-column: 1 / -1;">
+      <div class="card-title">
+        <span>🎙️ Audio Studio: INMP441 Microphone &amp; HW-104 Speaker Testing</span>
+        <div>
+          <span id="speakerBadge" class="badge b-off">SPEAKER: IDLE</span>
+          <span id="vadBadge" class="badge b-off" style="margin-left:6px">MIC: LISTENING</span>
+        </div>
+      </div>
+
+      <div class="grid-2col" style="margin-top:10px;gap:16px">
+        <!-- Microphone Testing & VU Visualizer -->
+        <div style="background:#0b1329;border:1px solid #1e293b;border-radius:8px;padding:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <strong style="color:var(--text);font-size:.88rem">🎤 INMP441 I2S Microphone (GPIO 17, 16, 23)</strong>
+            <span id="micRmsText" style="font-family:monospace;font-size:.82rem;color:#38bdf8">0% (-60 dB)</span>
+          </div>
+
+          <div style="font-size:.76rem;color:var(--muted);margin-bottom:4px">Real-Time Sound Level &amp; Peak Indicator</div>
+          <div class="bar-bg" style="height:14px;position:relative;background:#1e293b;border-radius:4px;overflow:hidden">
+            <div id="micRmsBar" class="bar-fill" style="width:0%;height:100%;transition:width 80ms;background:var(--ok)"></div>
+            <div id="micPeakMarker" style="position:absolute;top:0;bottom:0;width:3px;background:#f59e0b;left:0%;transition:left 120ms"></div>
+          </div>
+
+          <div class="row" style="margin-top:10px">
+            <span class="k">Hardware Loopback Test</span>
+            <span id="recStatusText" class="v" style="color:var(--muted)">Ready</span>
+          </div>
+
+          <div style="margin-top:10px">
+            <button id="btnLoopback" style="width:100%;background:#0284c7" onclick="triggerAction('mic_loopback')">
+              🔴 Record 2s &amp; Replay on Speaker
+            </button>
+            <div style="font-size:.73rem;color:var(--muted);margin-top:4px;text-align:center">
+              Speak into the mic for 2s — ESP32 records and replays directly through the HW-104 speaker
+            </div>
+          </div>
+        </div>
+
+        <!-- Speaker Verification Prompts & Audio Generator -->
+        <div style="background:#0b1329;border:1px solid #1e293b;border-radius:8px;padding:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <strong style="color:var(--text);font-size:.88rem">🔊 HW-104 Speaker Output (GPIO 4)</strong>
+            <button class="secondary" style="font-size:.72rem;padding:3px 8px;color:#f87171" onclick="triggerAction('voice_stop')">⏹️ Stop</button>
+          </div>
+
+          <div style="font-size:.76rem;color:var(--muted);margin-bottom:6px">🗣️ Spoken Action Sentences (Human Speech):</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(130px, 1fr));gap:6px">
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#10b981;color:#10b981" onclick="triggerAction('speak_sentence&sentence=light_on')">🗣️ "Light on"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#10b981;color:#10b981" onclick="triggerAction('speak_sentence&sentence=light_off')">🗣️ "Light off"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#10b981;color:#10b981" onclick="triggerAction('speak_sentence&sentence=door_open')">🗣️ "Door unlocked"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#10b981;color:#10b981" onclick="triggerAction('speak_sentence&sentence=door_close')">🗣️ "Door locked"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#10b981;color:#10b981" onclick="triggerAction('speak_sentence&sentence=gate_open')">🗣️ "Gate opened"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#10b981;color:#10b981" onclick="triggerAction('speak_sentence&sentence=gate_close')">🗣️ "Gate closed"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#10b981;color:#10b981" onclick="triggerAction('speak_sentence&sentence=access_granted')">🗣️ "Access granted"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#f87171;color:#f87171" onclick="triggerAction('speak_sentence&sentence=access_denied')">🗣️ "Access denied"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#f59e0b;color:#f59e0b" onclick="triggerAction('speak_sentence&sentence=smoke_alert')">🗣️ "Smoke alert"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#f59e0b;color:#f59e0b" onclick="triggerAction('speak_sentence&sentence=flame_alert')">🗣️ "Flame alert"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#38bdf8;color:#38bdf8" onclick="triggerAction('speak_sentence&sentence=confirmed')">🗣️ "Confirmed"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#f87171;color:#f87171" onclick="triggerAction('speak_sentence&sentence=error')">🗣️ "Error"</button>
+          </div>
+
+          <div style="font-size:.76rem;color:var(--muted);margin-top:10px;margin-bottom:6px">🎵 Musical Chimes (Synthesized Tones):</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(110px, 1fr));gap:6px">
+            <button class="secondary" style="font-size:.78rem;padding:6px 4px" onclick="triggerAction('voice_prompt&prompt=light_on')">💡 Light ON</button>
+            <button class="secondary" style="font-size:.78rem;padding:6px 4px" onclick="triggerAction('voice_prompt&prompt=light_off')">🌑 Light OFF</button>
+            <button class="secondary" style="font-size:.78rem;padding:6px 4px" onclick="triggerAction('voice_prompt&prompt=door_open')">🚪 Door Open</button>
+            <button class="secondary" style="font-size:.78rem;padding:6px 4px" onclick="triggerAction('voice_prompt&prompt=gate_open')">🚗 Gate Open</button>
+            <button class="secondary" style="font-size:.78rem;padding:6px 4px" onclick="triggerAction('voice_prompt&prompt=confirmed')">✅ Confirmed</button>
+            <button class="secondary" style="font-size:.78rem;padding:6px 4px" onclick="triggerAction('voice_prompt&prompt=error')">⚠️ Error Tone</button>
+            <button class="secondary" style="font-size:.78rem;padding:6px 4px" onclick="triggerAction('voice_prompt&prompt=siren')">🚨 1s Siren</button>
+          </div>
+
+          <div style="font-size:.76rem;color:var(--muted);margin-top:10px;margin-bottom:6px">Simulate Voice Commands (Action + Spoken Verification):</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(130px, 1fr));gap:6px">
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#38bdf8;color:#38bdf8" onclick="triggerAction('sim_voice&cmd=light_toggle')">🗣️ "Toggle Light"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#38bdf8;color:#38bdf8" onclick="triggerAction('sim_voice&cmd=open_door')">🗣️ "Open Door"</button>
+            <button class="secondary" style="font-size:.76rem;padding:5px 4px;border-color:#38bdf8;color:#38bdf8" onclick="triggerAction('sim_voice&cmd=open_gate')">🗣️ "Open Gate"</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Servos State -->
     <div class="card">
       <div class="card-title">Servos &amp; Barriers</div>
@@ -1156,6 +1672,7 @@ void handleRoot() {
     <!-- Hub Health -->
     <div class="card">
       <div class="card-title">System Diagnostics</div>
+      <div class="row"><span class="k">System Clock</span><span id="sysClockText" class="v">12:00:00 PM</span></div>
       <div class="row"><span class="k">System Uptime</span><span id="sysUptime" class="v">00:00:00</span></div>
       <div class="row"><span class="k">Free Heap Memory</span><span id="sysHeap" class="v">-- KB</span></div>
       <div class="row"><span class="k">ESP-NOW Dropped</span><span id="rxDropped" class="v">0</span></div>
@@ -1178,14 +1695,30 @@ void handleRoot() {
 
       <!-- Threshold Adjustments -->
       <div>
-        <strong style="color:var(--text);font-size:.9rem">Alarm Thresholds &amp; Timers</strong>
+        <strong style="color:var(--text);font-size:.9rem">Alarm Triggers &amp; Sensor Bypasses</strong>
         <div class="form-row">
-          <span>Flame ADC Threshold (&le; Trigger)</span>
-          <input id="cfgFire" type="number" min="100" max="3900" step="50">
+          <span>Sound Siren on Flame Detection</span>
+          <input id="cfgFireSiren" type="checkbox">
         </div>
         <div class="form-row">
-          <span>Smoke MQ-2 Threshold (&ge; Trigger)</span>
-          <input id="cfgSmoke" type="number" min="200" max="4000" step="50">
+          <span>Sound Siren on Smoke/Gas MQ-2</span>
+          <input id="cfgSmokeSiren" type="checkbox">
+        </div>
+        <div class="form-row">
+          <span>Sound Siren on PIR Motion</span>
+          <input id="cfgMotSiren" type="checkbox">
+        </div>
+        <div class="form-row">
+          <span>Sound Siren on Ultrasonic Range</span>
+          <input id="cfgUltSiren" type="checkbox">
+        </div>
+        <div class="form-row">
+          <span>Flame Active-LOW (0V = Flame)</span>
+          <input id="cfgFireActLow" type="checkbox">
+        </div>
+        <div class="form-row">
+          <span>MQ-2 Active-LOW (0V = Smoke)</span>
+          <input id="cfgSmokeActLow" type="checkbox">
         </div>
         <div class="form-row">
           <span>Ultrasonic Proximity Distance (cm)</span>
@@ -1200,15 +1733,34 @@ void handleRoot() {
           <input id="cfgDoor" type="number" min="1000" max="30000" step="500">
         </div>
         <div class="form-row">
-          <span>Sound Siren on PIR Motion</span>
-          <input id="cfgMotSiren" type="checkbox">
+          <span>Spoken Voice Sentences (Natural Speech vs Chimes)</span>
+          <input id="cfgVoiceSpoken" type="checkbox">
         </div>
         <div class="form-row">
-          <span>Sound Siren on Ultrasonic Range</span>
-          <input id="cfgUltSiren" type="checkbox">
+          <span>PIR Night-Only Siren Guard</span>
+          <input id="cfgPirSched" type="checkbox">
         </div>
-        <div style="margin-top:10px">
+        <div class="form-row">
+          <span>PIR Guard Window (Midnight - 7 AM)</span>
+          <div style="display:flex;gap:4px;align-items:center">
+            <input id="cfgPirSH" type="number" min="0" max="23" style="width:55px" placeholder="00"> :
+            <input id="cfgPirSM" type="number" min="0" max="59" style="width:55px" placeholder="00">
+            <span style="font-size:.8rem;color:var(--muted);margin:0 2px">to</span>
+            <input id="cfgPirEH" type="number" min="0" max="23" style="width:55px" placeholder="07"> :
+            <input id="cfgPirEM" type="number" min="0" max="59" style="width:55px" placeholder="00">
+          </div>
+        </div>
+        <div class="form-row">
+          <span>Set Hub Clock (HH:MM)</span>
+          <div style="display:flex;gap:4px;align-items:center">
+            <input id="manHour" type="number" min="0" max="23" style="width:55px" placeholder="HH"> :
+            <input id="manMin" type="number" min="0" max="59" style="width:55px" placeholder="MM">
+            <button class="secondary" style="padding:4px 8px;font-size:.76rem" onclick="setManualTime()">Set</button>
+          </div>
+        </div>
+        <div style="margin-top:10px;display:flex;gap:8px">
           <button onclick="saveSettings()">Save Thresholds</button>
+          <button class="secondary" onclick="syncBrowserTime()">⏱️ Sync Browser Time</button>
         </div>
       </div>
 
@@ -1237,23 +1789,64 @@ void handleRoot() {
 
 <script>
 let cfgLoaded = false;
+let cam1MjpegActive = false;
+let cam1MjpegFrames = 0;
+let cam1LastFpsTs = performance.now();
 
-// Auto-refresh camera frames
+// Auto-refresh camera frames with direct stream support (without leaking extra MJPEG client slots)
 function streamCam(camId, imgId, badgeId, perfId, tagId){
+  const img = document.getElementById(imgId);
+  if (camId === 1) {
+    // Only attempt direct 192.168.4.101:81 MJPEG when browsing on the SoftAP subnet
+    const canDirectStream = (window.location.hostname === "192.168.4.1");
+    if (!canDirectStream) {
+      pollSnapshot(camId, imgId, badgeId, perfId);
+      return;
+    }
+    cam1MjpegActive = true;
+    cam1MjpegFrames = 0;
+    cam1LastFpsTs = performance.now();
+    img.onload = () => {
+      if (!cam1MjpegActive) return;
+      document.getElementById(badgeId).textContent = "LIVE (MJPEG)";
+      document.getElementById(badgeId).className = "badge b-ok";
+      cam1MjpegFrames++;
+      const now = performance.now();
+      if (now - cam1LastFpsTs >= 1000) {
+        const fps = Math.round((cam1MjpegFrames * 1000) / (now - cam1LastFpsTs) * 10) / 10;
+        document.getElementById(perfId).textContent = fps + " FPS";
+        cam1MjpegFrames = 0;
+        cam1LastFpsTs = now;
+      }
+    };
+    img.onerror = () => {
+      if (!cam1MjpegActive) return;
+      cam1MjpegActive = false;
+      img.onload = null;
+      img.onerror = null;
+      pollSnapshot(camId, imgId, badgeId, perfId);
+    };
+    img.src = "http://192.168.4.101:81/stream?t=" + Date.now();
+    return;
+  }
+}
+
+function pollSnapshot(camId, imgId, badgeId, perfId){
+  if (cam1MjpegActive) return;
   const img = document.getElementById(imgId);
   const next = new Image();
   const t0 = performance.now();
   next.onload = ()=>{
     img.src = next.src;
-    document.getElementById(badgeId).textContent = "LIVE";
+    document.getElementById(badgeId).textContent = "LIVE (SNAPSHOT)";
     document.getElementById(badgeId).className = "badge b-ok";
     document.getElementById(perfId).textContent = Math.round(performance.now() - t0) + " ms";
-    setTimeout(()=>streamCam(camId, imgId, badgeId, perfId, tagId), 350);
+    setTimeout(()=>pollSnapshot(camId, imgId, badgeId, perfId), 350);
   };
   next.onerror = ()=>{
     document.getElementById(badgeId).textContent = "OFFLINE";
     document.getElementById(badgeId).className = "badge b-bad";
-    setTimeout(()=>streamCam(camId, imgId, badgeId, perfId, tagId), 1600);
+    setTimeout(()=>pollSnapshot(camId, imgId, badgeId, perfId), 1600);
   };
   next.src = "/api/cam/" + camId + "/preview.jpg?t=" + Date.now();
 }
@@ -1278,30 +1871,65 @@ async function refreshStatus(){
     bMute.className = "badge " + (d.sirenMuted ? "b-warn" : "b-ok");
     document.getElementById('btnMute').textContent = d.sirenMuted ? "Unmute Siren" : "Mute Siren";
 
-    // Sensors: Flame
+    // Sensors: Flame (Digital DO on GPIO34)
     const fVal = document.getElementById('flameVal');
-    fVal.textContent = d.flameAdc;
-    const fPct = Math.min(100, Math.max(0, Math.round(((4095 - d.flameAdc)/4095)*100)));
-    document.getElementById('flameBar').style.width = fPct + "%";
-    document.getElementById('flameBar').className = "bar-fill " + (d.fire ? "bar-danger" : "");
+    if (fVal) {
+      fVal.textContent = (d.flameDigital === 0 ? "LOW (0V)" : "HIGH (3.3V)") + (d.fire ? " - TRIGGERED" : " - SAFE");
+    }
     const fBadge = document.getElementById('flameBadge');
-    fBadge.textContent = d.fire ? "FIRE ALERT" : "SAFE";
-    fBadge.className = "badge " + (d.fire ? "b-bad" : "b-ok");
+    if (fBadge) {
+      if (d.fire) {
+        fBadge.textContent = (d.cfg && !d.cfg.fireSiren) ? "FLAME (IGNORED)" : "FIRE ALERT";
+        fBadge.className = "badge b-bad";
+      } else {
+        fBadge.textContent = "SAFE";
+        fBadge.className = "badge b-ok";
+      }
+    }
+    const fSirenBadge = document.getElementById('flameSirenBadge');
+    if (fSirenBadge && d.cfg) {
+      fSirenBadge.textContent = d.cfg.fireSiren ? "ARMED" : "IGNORED";
+      fSirenBadge.className = "badge " + (d.cfg.fireSiren ? "b-ok" : "b-warn");
+    }
+    const btnToggleFlame = document.getElementById('btnToggleFlameAlarm');
+    if (btnToggleFlame && d.cfg) {
+      btnToggleFlame.textContent = d.cfg.fireSiren ? "🔕 Ignore Flame Alarm" : "🔔 Arm Flame Alarm";
+    }
 
-    // Sensors: Smoke
-    document.getElementById('smokeVal').textContent = d.smokeAdc;
-    const sPct = Math.min(100, Math.max(0, Math.round((d.smokeAdc/4095)*100)));
-    document.getElementById('smokeBar').style.width = sPct + "%";
-    document.getElementById('smokeBar').className = "bar-fill " + (d.smoke ? "bar-danger" : (d.smokeAdc>1200?"bar-warn":""));
+    // Sensors: Smoke (Digital DO on GPIO35)
+    const sVal = document.getElementById('smokeVal');
+    if (sVal) {
+      sVal.textContent = (d.smokeDigital === 0 ? "LOW (0V)" : "HIGH (3.3V)") + (d.smoke ? " - TRIGGERED" : " - CLEAN");
+    }
     const sBadge = document.getElementById('smokeBadge');
-    sBadge.textContent = d.smoke ? "SMOKE ALERT" : "CLEAN";
-    sBadge.className = "badge " + (d.smoke ? "b-bad" : "b-ok");
+    if (sBadge) {
+      if (d.smoke) {
+        sBadge.textContent = (d.cfg && !d.cfg.smokeSiren) ? "SMOKE (IGNORED)" : "SMOKE ALERT";
+        sBadge.className = "badge b-bad";
+      } else {
+        sBadge.textContent = "CLEAN";
+        sBadge.className = "badge b-ok";
+      }
+    }
+    const sSirenBadge = document.getElementById('smokeSirenBadge');
+    if (sSirenBadge && d.cfg) {
+      sSirenBadge.textContent = d.cfg.smokeSiren ? "ARMED" : "IGNORED";
+      sSirenBadge.className = "badge " + (d.cfg.smokeSiren ? "b-ok" : "b-warn");
+    }
+    const btnToggleSmoke = document.getElementById('btnToggleSmokeAlarm');
+    if (btnToggleSmoke && d.cfg) {
+      btnToggleSmoke.textContent = d.cfg.smokeSiren ? "🔕 Ignore Smoke Alarm" : "🔔 Arm Smoke Alarm";
+    }
 
     // Sensors: PIR
     const pBadge = document.getElementById('pirBadge');
     pBadge.textContent = d.pir ? "MOTION" : "CLEAR";
     pBadge.className = "badge " + (d.pir ? "b-warn" : "b-ok");
     document.getElementById('pirVal').textContent = d.pir ? "MOTION DETECTED!" : "No Motion";
+    const btnTogglePir = document.getElementById('btnTogglePirAlarm');
+    if (btnTogglePir && d.cfg) {
+      btnTogglePir.textContent = d.cfg.motSiren ? "🔕 Ignore Motion Alarm" : "🔔 Arm Motion Alarm";
+    }
 
     // Sensors: Ultrasonic
     document.getElementById('ultraVal').textContent = d.distCm>=0 ? (d.distCm.toFixed(1) + " cm") : "Out of Range";
@@ -1309,13 +1937,119 @@ async function refreshStatus(){
     document.getElementById('ultraBar').style.width = uPct + "%";
     document.getElementById('ultraBar').className = "bar-fill " + (d.ultra ? "bar-danger" : "");
     const uBadge = document.getElementById('ultraBadge');
-    uBadge.textContent = d.ultra ? "PROXIMITY" : "CLEAR";
+    uBadge.textContent = d.ultra ? ((d.cfg && !d.cfg.ultSiren) ? "PROX (IGNORED)" : "PROXIMITY") : "CLEAR";
     uBadge.className = "badge " + (d.ultra ? "b-warn" : "b-ok");
+    const uSirenBadge = document.getElementById('ultraSirenBadge');
+    if (uSirenBadge && d.cfg) {
+      uSirenBadge.textContent = d.cfg.ultSiren ? "ARMED" : "IGNORED";
+      uSirenBadge.className = "badge " + (d.cfg.ultSiren ? "b-ok" : "b-warn");
+    }
+    const btnToggleUltra = document.getElementById('btnToggleUltraAlarm');
+    if (btnToggleUltra && d.cfg) {
+      btnToggleUltra.textContent = d.cfg.ultSiren ? "🔕 Ignore Range Alarm" : "🔔 Arm Range Alarm";
+    }
 
     // Servos & Siren
     document.getElementById('gateState').textContent = (d.gateOpen?"OPEN ":"CLOSED ") + "(" + d.servo1 + "°/" + d.servo2 + "°)";
     document.getElementById('doorState').textContent = (d.doorOpen?"OPEN ":"CLOSED ") + "(" + d.door3 + "°)";
     document.getElementById('sirenHz').textContent = d.sirenActive ? (d.sirenHz + " Hz") : "OFF";
+
+    // System Clock HUD
+    if (d.time) {
+      document.getElementById('sysClockBadge').textContent = (d.time.synced ? "🕒 " : "⏱️ [12PM] ") + d.time.timeOnly;
+      document.getElementById('sysClockBadge').className = "badge " + (d.time.synced ? "b-ok" : "b-warn");
+      document.getElementById('sysClockText').textContent = d.time.clock + (d.time.synced ? " (Synced)" : " (Default 12PM)");
+    }
+
+    // Smart Lighting
+    const lBadge = document.getElementById('lightBadge');
+    const lText = document.getElementById('lightStateText');
+    if (d.lightState) {
+      lBadge.textContent = "LIGHT ON";
+      lBadge.className = "badge b-ok";
+      lText.textContent = "ON (3.3V Active on GPIO21)";
+      document.getElementById('btnLightToggle').textContent = "Turn OFF";
+    } else {
+      lBadge.textContent = "LIGHT OFF";
+      lBadge.className = "badge b-off";
+      lText.textContent = "OFF (0V Idle on GPIO21)";
+      document.getElementById('btnLightToggle').textContent = "Turn ON";
+    }
+
+    // Voice Assistant & Audio Studio Telemetry
+    if (d.mic) {
+      const vBadge = document.getElementById('vadBadge');
+      if (d.mic.recording) {
+        vBadge.textContent = "RECORDING 🔴";
+        vBadge.className = "badge b-bad";
+      } else if (d.mic.vad) {
+        vBadge.textContent = "SPEECH DETECTED";
+        vBadge.className = "badge b-warn";
+      } else {
+        vBadge.textContent = d.mic.online ? "LISTENING" : "OFFLINE";
+        vBadge.className = "badge " + (d.mic.online ? "b-ok" : "b-danger");
+      }
+
+      document.getElementById('micRmsText').textContent = "RMS: " + d.mic.rms + "% | Peak: " + d.mic.peak + "% (" + d.mic.db + " dB)";
+      const bar = document.getElementById('micRmsBar');
+      bar.style.width = Math.min(100, d.mic.rms) + "%";
+      bar.style.background = (d.mic.rms > 50) ? "var(--danger)" : ((d.mic.rms > 20) ? "var(--warn)" : "var(--ok)");
+
+      const marker = document.getElementById('micPeakMarker');
+      if (marker) {
+        marker.style.left = Math.min(99, d.mic.peak) + "%";
+      }
+
+      const recText = document.getElementById('recStatusText');
+      const btnLoop = document.getElementById('btnLoopback');
+      if (d.mic.recording) {
+        recText.textContent = "Recording (" + d.mic.recProgress + "%)... Speak!";
+        recText.style.color = "#ef4444";
+        btnLoop.disabled = true;
+        btnLoop.textContent = "⏳ Recording (" + d.mic.recProgress + "%)...";
+      } else {
+        recText.textContent = (d.speaker && d.speaker.playing) ? "Replaying on Speaker..." : "Ready";
+        recText.style.color = (d.speaker && d.speaker.playing) ? "#38bdf8" : "var(--muted)";
+        btnLoop.disabled = false;
+        btnLoop.textContent = "🔴 Record 2s & Replay on Speaker";
+      }
+    }
+
+    if (d.speaker) {
+      const spkBadge = document.getElementById('speakerBadge');
+      if (spkBadge) {
+        if (d.speaker.playing) {
+          spkBadge.textContent = "🔊 " + (d.speaker.current && d.speaker.current !== "Idle" ? d.speaker.current.toUpperCase() : "PLAYING");
+          spkBadge.className = "badge b-warn";
+        } else {
+          spkBadge.textContent = "SPEAKER: IDLE";
+          spkBadge.className = "badge b-off";
+        }
+      }
+    }
+
+    // PIR Schedule Status
+    if (d.cfg) {
+      const sh = String(d.cfg.pirSH).padStart(2,'0');
+      const sm = String(d.cfg.pirSM).padStart(2,'0');
+      const eh = String(d.cfg.pirEH).padStart(2,'0');
+      const em = String(d.cfg.pirEM).padStart(2,'0');
+      document.getElementById('pirWindowText').textContent = sh + ":" + sm + " - " + eh + ":" + em;
+      const pGuard = document.getElementById('pirGuardBadge');
+      if (!d.cfg.motSiren) {
+        pGuard.textContent = "SIREN MUTED";
+        pGuard.className = "badge b-off";
+      } else if (!d.cfg.pirSched) {
+        pGuard.textContent = "ARMED 24/7";
+        pGuard.className = "badge b-bad";
+      } else if (d.pirSchedActive) {
+        pGuard.textContent = "ARMED (NIGHT)";
+        pGuard.className = "badge b-bad";
+      } else {
+        pGuard.textContent = "QUIET HOURS";
+        pGuard.className = "badge b-off";
+      }
+    }
 
     // Network & Diags
     document.getElementById('wifiClients').textContent = d.wifi.apStations + " device(s) connected";
@@ -1324,29 +2058,41 @@ async function refreshStatus(){
     document.getElementById('sysHeap').textContent = Math.round(d.freeHeap/1024) + " KB";
     document.getElementById('rxDropped').textContent = d.rxDropped;
 
-    // Cameras Telemetry
+    // Camera 1 (Face Cam) Telemetry
     const c1Tag = document.getElementById('cam1Tag');
     c1Tag.textContent = d.faceCam.event;
     c1Tag.className = "badge " + (d.faceCam.event==='RECOGNIZED'?'b-ok':(d.faceCam.event==='UNKNOWN'?'b-bad':'b-off'));
     document.getElementById('cam1Who').textContent = d.faceCam.label + " (" + d.faceCam.conf + "%)";
     document.getElementById('cam1Link').textContent = d.faceCam.online ? ("Online (" + d.faceCam.ageSec + "s ago)") : "Offline";
 
-    const c2Tag = document.getElementById('cam2Tag');
-    c2Tag.textContent = d.plateCam.event;
-    c2Tag.className = "badge " + (d.plateCam.event==='RECOGNIZED'?'b-ok':(d.plateCam.event==='UNKNOWN'?'b-bad':'b-off'));
-    document.getElementById('cam2Plate').textContent = d.plateCam.label + " (" + d.plateCam.conf + "%)";
-    document.getElementById('cam2Link').textContent = d.plateCam.online ? ("Online (" + d.plateCam.ageSec + "s ago)") : "Offline";
+    // RFID Car Gate Telemetry (Replaces plateCam)
+    if(d.rfid){
+      document.getElementById('rfidUidText').textContent = d.rfid.lastUid ? d.rfid.lastUid : "NO CARD SCANNED";
+      document.getElementById('rfidAccepted').textContent = d.rfid.acceptedUid;
+      document.getElementById('rfidLastSeen').textContent = d.rfid.lastScanSec < 9999 ? (d.rfid.lastScanSec + "s ago") : "---";
+      const isAuth = (d.rfid.lastUid === d.rfid.acceptedUid);
+      document.getElementById('rfidStatus').textContent = isAuth ? "AUTHORIZED" : (d.rfid.lastUid ? "DENIED" : "ACTIVE");
+      document.getElementById('rfidStatus').className = "badge " + (isAuth ? "b-ok" : (d.rfid.lastUid ? "b-bad" : "b-ok"));
+    }
 
     // Populate Settings once
     if(!cfgLoaded && d.cfg){
       cfgLoaded = true;
-      document.getElementById('cfgFire').value = d.cfg.fireTh;
-      document.getElementById('cfgSmoke').value = d.cfg.smokeTh;
+      document.getElementById('cfgFireSiren').checked = d.cfg.fireSiren;
+      document.getElementById('cfgSmokeSiren').checked = d.cfg.smokeSiren;
+      document.getElementById('cfgFireActLow').checked = d.cfg.fireActLow;
+      document.getElementById('cfgSmokeActLow').checked = d.cfg.smokeActLow;
+      document.getElementById('cfgVoiceSpoken').checked = (d.cfg.voiceSpoken !== false);
       document.getElementById('cfgUltra').value = d.cfg.ultraCm;
       document.getElementById('cfgGate').value = d.cfg.gateMs;
       document.getElementById('cfgDoor').value = d.cfg.doorMs;
       document.getElementById('cfgMotSiren').checked = d.cfg.motSiren;
       document.getElementById('cfgUltSiren').checked = d.cfg.ultSiren;
+      document.getElementById('cfgPirSched').checked = d.cfg.pirSched;
+      document.getElementById('cfgPirSH').value = d.cfg.pirSH;
+      document.getElementById('cfgPirSM').value = d.cfg.pirSM;
+      document.getElementById('cfgPirEH').value = d.cfg.pirEH;
+      document.getElementById('cfgPirEM').value = d.cfg.pirEM;
       document.getElementById('staSsid').value = d.wifi.staSsid;
     }
 
@@ -1374,17 +2120,42 @@ async function toggleMute(){
 
 async function saveSettings(){
   const p = new URLSearchParams({
-    fire_th: document.getElementById('cfgFire').value,
-    smoke_th: document.getElementById('cfgSmoke').value,
+    fire_siren: document.getElementById('cfgFireSiren').checked ? 1 : 0,
+    smoke_siren: document.getElementById('cfgSmokeSiren').checked ? 1 : 0,
+    fire_actlow: document.getElementById('cfgFireActLow').checked ? 1 : 0,
+    smoke_actlow: document.getElementById('cfgSmokeActLow').checked ? 1 : 0,
+    voice_spoken: document.getElementById('cfgVoiceSpoken').checked ? 1 : 0,
     ultra_cm: document.getElementById('cfgUltra').value,
     gate_ms: document.getElementById('cfgGate').value,
     door_ms: document.getElementById('cfgDoor').value,
     mot_siren: document.getElementById('cfgMotSiren').checked ? 1 : 0,
-    ult_siren: document.getElementById('cfgUltSiren').checked ? 1 : 0
+    ult_siren: document.getElementById('cfgUltSiren').checked ? 1 : 0,
+    pir_sched: document.getElementById('cfgPirSched').checked ? 1 : 0,
+    pir_sh: document.getElementById('cfgPirSH').value,
+    pir_sm: document.getElementById('cfgPirSM').value,
+    pir_eh: document.getElementById('cfgPirEH').value,
+    pir_em: document.getElementById('cfgPirEM').value
   });
   await fetch('/api/config?' + p.toString(), {method:'POST'});
   alert('Settings saved to NVS!');
   cfgLoaded = false;
+  refreshStatus();
+}
+
+async function syncBrowserTime(){
+  const now = new Date();
+  const epoch = Math.floor(now.getTime() / 1000);
+  await fetch('/api/time?epoch=' + epoch, {method:'POST'});
+  alert('System clock synchronized with browser: ' + now.toLocaleTimeString());
+  refreshStatus();
+}
+
+async function setManualTime(){
+  const h = document.getElementById('manHour').value;
+  const m = document.getElementById('manMin').value;
+  if(h === '' || m === ''){ alert('Please enter hour and minute'); return; }
+  await fetch('/api/time?hour=' + h + '&min=' + m, {method:'POST'});
+  alert('System clock updated to ' + h.padStart(2,'0') + ':' + m.padStart(2,'0'));
   refreshStatus();
 }
 
@@ -1409,7 +2180,6 @@ async function saveWifi(disconnect){
 
 // Start live streams & polling
 streamCam(1, 'cam1Img', 'cam1Status', 'cam1Fps', 'cam1Tag');
-streamCam(2, 'cam2Img', 'cam2Status', 'cam2Fps', 'cam2Tag');
 refreshStatus();
 setInterval(refreshStatus, 1000);
 </script>
@@ -1436,8 +2206,13 @@ void onWiFiEvent(WiFiEvent_t event) {
     char msg[64];
     snprintf(msg, sizeof(msg), "Home Wi-Fi connected! Assigned IP: %s", WiFi.localIP().toString().c_str());
     addEventLog("success", msg);
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
   } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
-    addEventLog("warning", "Home Wi-Fi station link disconnected");
+    static unsigned long lastStaDiscMs = 0;
+    if (millis() - lastStaDiscMs >= 10000) {
+      lastStaDiscMs = millis();
+      addEventLog("warning", "Home Wi-Fi station link disconnected");
+    }
   }
 }
 
@@ -1476,6 +2251,9 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 
+  pinMode(LIGHT_PIN, OUTPUT);
+  digitalWrite(LIGHT_PIN, LOW);
+
   pinMode(FIRE_SENSOR_PIN, INPUT);
   pinMode(MQ2_SENSOR_PIN, INPUT);
   pinMode(PIR_SENSOR_PIN, INPUT_PULLDOWN);
@@ -1488,24 +2266,61 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  initDefaultSystemTime();
   loadConfigFromNvs();
 
-  // Servo timers
+  // Servo timers (allocate Timers 0 & 1 for gate & door servos)
   ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
   attachGateServo(gateServo1, GATE_SERVO_1_PIN, currentServo1Angle, "gate servo 1");
   attachGateServo(gateServo2, GATE_SERVO_2_PIN, currentServo2Angle, "gate servo 2");
   attachGateServo(doorServo3, DOOR_SERVO_3_PIN, currentDoor3Angle, "face door servo 3");
 
-  // Siren LEDC Setup (Channel 4)
+  // Siren LEDC Setup (Channel 4 on Timer 2)
   ledcSetup(SIREN_LEDC_CHANNEL, SIREN_LOW_HZ, SIREN_RESOLUTION_BITS);
   ledcAttachPin(BUZZER_PIN, SIREN_LEDC_CHANNEL);
   buzzerAttached = true;
   ledcWriteTone(SIREN_LEDC_CHANNEL, 0);
 
+  // Voice Audio Engine (HW-104 PAM8403 on GPIO4, Channel 6 on Timer 3)
+  initVoiceEngine(AMPLIFIER_PIN, AUDIO_LEDC_CHANNEL);
+
+  // I2S Microphone (INMP441 on GPIO17/16/23)
+  initMicI2S();
+  registerVoiceCommandCallback(onVoiceCommandReceived);
+
   // RFID reader init (MFRC522)
+  // Explicit hard-reset pulse on RST before init: ESP32 soft-reset alone is often
+  // unreliable and can leave the MFRC522 in a non-responsive state.
+  pinMode(RFID_RST_PIN, OUTPUT);
+  digitalWrite(RFID_RST_PIN, LOW);
+  delayMicroseconds(100);
+  digitalWrite(RFID_RST_PIN, HIGH);
+  delay(50);  // MFRC522 oscillator start-up time
+
   SPI.begin(RFID_SCK_PIN, RFID_MISO_PIN, RFID_MOSI_PIN, RFID_SS_PIN);
+
+  // Raw SPI diagnostic: read VersionReg (0x37) directly to verify SPI comms
+  // independent of the library's register addressing convention.
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(RFID_SS_PIN, LOW);
+  SPI.transfer(0x80 | 0x37);   // read VersionReg
+  uint8_t rawVersion = SPI.transfer(0);
+  digitalWrite(RFID_SS_PIN, HIGH);
+  SPI.endTransaction();
+  Serial.print("[RFID] Raw SPI VersionReg: 0x");
+  Serial.println(rawVersion, HEX);
+
   rfid.PCD_Init();
-  Serial.println("[RFID] Reader initialized. Present a card to read its UID.");
+  rfidChipVersion = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+  rfidInitOk = (rfidChipVersion != 0x00 && rfidChipVersion != 0xFF);
+  Serial.print("[RFID] Reader init: chip version 0x");
+  Serial.println(rfidChipVersion, HEX);
+  if (!rfidInitOk) {
+    Serial.println("[RFID] ERROR: MFRC522 not responding on SPI — check: VCC=3.3V (not 5V), RST not held low, adequate 3.3V current for antenna, SS=GPIO5 pulled up to 3.3V");
+  } else {
+    Serial.println("[RFID] Reader initialized. Present a card to read its UID.");
+  }
 
   // Network initialization
   initHubWiFi();
@@ -1523,7 +2338,9 @@ void setup() {
   server.on("/api/status", HTTP_GET, handleApiStatus);
   server.on("/api/control", HTTP_POST, handleApiControl);
   server.on("/api/config", HTTP_POST, handleApiConfig);
+  server.on("/api/time", HTTP_POST, handleApiTime);
   server.on("/api/wifi", HTTP_POST, handleApiWifi);
+  server.on("/api/cam/event", HTTP_POST, handleApiCamEvent);
   server.on("/api/cam/1/preview.jpg", HTTP_GET, []() { handleCamProxy(1); });
   server.on("/api/cam/2/preview.jpg", HTTP_GET, []() { handleCamProxy(2); });
   server.begin();
@@ -1548,43 +2365,65 @@ void loop() {
   // 2. Service WebServer requests
   server.handleClient();
 
-  // 3. Read analog sensors
-  lastFlameAdc = analogRead(FIRE_SENSOR_PIN);
-  lastSmokeAdc = analogRead(MQ2_SENSOR_PIN);
+  // 3. Read digital safety sensors (DO on GPIO34 and GPIO35)
+  lastFlameDigital = digitalRead(FIRE_SENSOR_PIN);
+  lastSmokeDigital = digitalRead(MQ2_SENSOR_PIN);
   lastMotionDetected = (digitalRead(PIR_SENSOR_PIN) == HIGH);
 
-  lastFireDetected = (lastFlameAdc <= g_cfg.fireThreshold);
-  lastSmokeDetected = (lastSmokeAdc >= g_cfg.smokeThreshold);
+  lastFireDetected = g_cfg.fireActiveLow ? (lastFlameDigital == LOW) : (lastFlameDigital == HIGH);
+  lastSmokeDetected = g_cfg.smokeActiveLow ? (lastSmokeDigital == LOW) : (lastSmokeDigital == HIGH);
 
   // 4. Update non-blocking ultrasonic sensor
   updateUltrasonicSensor(now);
 
-  // 4b. RFID card reader — print UID to Serial when a new card is presented
-  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    String uid;
-    for (byte i = 0; i < rfid.uid.size; i++) {
-      if (rfid.uid.uidByte[i] < 0x10) uid += "0";
-      uid += String(rfid.uid.uidByte[i], HEX);
-    }
-    uid.toUpperCase();
-    if (uid != lastRfidUid || (now - lastRfidPrintMs >= RFID_PRINT_INTERVAL_MS)) {
-      lastRfidUid = uid;
+  // 4b. RFID card reader — controls main car gate (Servos 1 & 2 to 160°)
+  if (!rfidInitOk) {
+    if (now - lastRfidPrintMs >= 10000) {
       lastRfidPrintMs = now;
-      Serial.print("[RFID] Card UID: ");
-      Serial.println(uid);
+      Serial.println("[RFID] Reader not initialized — skipping card reads");
+    }
+  } else if (rfid.PICC_IsNewCardPresent()) {
+    if (rfid.PICC_ReadCardSerial()) {
+      String uid;
+      for (byte i = 0; i < rfid.uid.size; i++) {
+        if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+        uid += String(rfid.uid.uidByte[i], HEX);
+      }
+      uid.toUpperCase();
+      if (uid != lastRfidUid || (now - lastRfidPrintMs >= RFID_PRINT_INTERVAL_MS)) {
+        lastRfidUid = uid;
+        lastRfidPrintMs = now;
+        Serial.print("[RFID] Card UID: ");
+        Serial.println(uid);
 
-      if (uid == ACCEPTED_RFID_UID) {
-        plateGateUntilMs = now + g_cfg.gateHoldMs;
-        setGateOpen(true);
-        Serial.println("[RFID] Accepted card -> Gate opened (Servos 1 & 2)");
-      } else {
-        camAlarmUntilMs = now + g_cfg.camAlarmMs;
-        startSiren(now);
-        Serial.println("[RFID] Unknown card -> Intruder alarm started");
+        if (uid == ACCEPTED_RFID_UID) {
+          plateGateUntilMs = now + g_cfg.gateHoldMs;
+          setGateOpen(true);
+          if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_ACCESS_GRANTED);
+          char msg[72];
+          snprintf(msg, sizeof(msg), "RFID Authorized [%s] -> Car Gate opened", uid.c_str());
+          addEventLog("success", msg);
+          Serial.println("[RFID] Accepted card -> Gate opened (Servos 1 & 2 to 160°)");
+        } else {
+          camAlarmUntilMs = now + g_cfg.camAlarmMs;
+          startSiren(now);
+          if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_ACCESS_DENIED);
+          char msg[72];
+          snprintf(msg, sizeof(msg), "RFID Unknown [%s] -> Intruder alarm", uid.c_str());
+          addEventLog("danger", msg);
+          Serial.println("[RFID] Unknown card -> Intruder alarm started");
+        }
+      }
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+    } else {
+      // Card present but serial read failed — log occasionally for diagnostics
+      static unsigned long lastRfidReadFailMs = 0;
+      if (now - lastRfidReadFailMs >= 2000) {
+        lastRfidReadFailMs = now;
+        Serial.println("[RFID] Card present but read serial failed — check antenna/power");
       }
     }
-    rfid.PICC_HaltA();
-    rfid.PCD_StopCrypto1();
   }
 
   // 5. Evaluate camera intruder alert timeout
@@ -1607,11 +2446,28 @@ void loop() {
     }
   }
 
-  // 7. Master alarm evaluation
-  bool motionAlarm = (lastMotionDetected && g_cfg.motionTriggersSiren);
+  // 7. Master alarm evaluation (supports per-sensor alarm bypassing/ignoring)
+  bool pirScheduleActive = true;
+  if (g_cfg.pirScheduleEnabled) {
+    pirScheduleActive = isPirScheduleActive();
+  }
+  bool fireAlarm   = (lastFireDetected && g_cfg.fireTriggersSiren);
+  bool smokeAlarm  = (lastSmokeDetected && g_cfg.smokeTriggersSiren);
+  bool motionAlarm = (lastMotionDetected && g_cfg.motionTriggersSiren && pirScheduleActive);
   bool ultraAlarm  = (lastUltrasonicDetected && g_cfg.ultraTriggersSiren);
 
-  lastAlarmActive = lastFireDetected || lastSmokeDetected || motionAlarm ||
+  static bool prevFireAlarm = false;
+  static bool prevSmokeAlarm = false;
+  if (fireAlarm && !prevFireAlarm) {
+    if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_FLAME_ALERT);
+  }
+  if (smokeAlarm && !prevSmokeAlarm) {
+    if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_SMOKE_ALERT);
+  }
+  prevFireAlarm = fireAlarm;
+  prevSmokeAlarm = smokeAlarm;
+
+  lastAlarmActive = fireAlarm || smokeAlarm || motionAlarm ||
                     ultraAlarm || camAlarmActive || sirenTestActive;
 
   if (lastAlarmActive) {
@@ -1627,11 +2483,20 @@ void loop() {
   // 9. Serial debug monitor
   if (now - lastPrintMs >= 500) {
     lastPrintMs = now;
-    Serial.printf("Sensors: Flame=%d (%s) | Smoke=%d (%s) | PIR=%s | Ultra=%s | Alarm=%s | Gate=%s | Door=%s\n",
-                  lastFlameAdc, lastFireDetected ? "FIRE!" : "ok",
-                  lastSmokeAdc, lastSmokeDetected ? "SMOKE!" : "ok",
+    time_t printTime = time(nullptr);
+    struct tm printTm;
+    localtime_r(&printTime, &printTm);
+    char timePrintBuf[16];
+    strftime(timePrintBuf, sizeof(timePrintBuf), "%H:%M:%S", &printTm);
+
+    Serial.printf("[%s] Sensors: Flame=DO:%d (%s|%s) | Smoke=DO:%d (%s|%s) | PIR=%s (Guard:%s) | Ultra=%s | Light=%s | Alarm=%s | Gate=%s | Door=%s\n",
+                  timePrintBuf,
+                  lastFlameDigital, lastFireDetected ? "FIRE!" : "ok", g_cfg.fireTriggersSiren ? "armed" : "ignored",
+                  lastSmokeDigital, lastSmokeDetected ? "SMOKE!" : "ok", g_cfg.smokeTriggersSiren ? "armed" : "ignored",
                   lastMotionDetected ? "MOTION" : "clear",
+                  pirScheduleActive ? "ARMED" : "QUIET",
                   lastUltrasonicDetected ? "NEAR" : "clear",
+                  lightState ? "ON" : "OFF",
                   lastAlarmActive ? (g_cfg.sirenMuted ? "MUTED" : "ACTIVE") : "off",
                   gateOpen ? "OPEN" : "closed",
                   doorOpen ? "OPEN" : "closed");

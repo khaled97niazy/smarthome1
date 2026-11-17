@@ -47,11 +47,20 @@ void camHwApplySensorSettings(bool hmirror,
 void camHwInitPreview();
 void camHwUpdatePreviewJpeg(const camera_fb_t *fb,
                             pixformat_t srcFormat,
-                            uint8_t quality = 68);
+                            uint8_t quality = 58);
+void camHwUpdatePreviewJpegBytes(const uint8_t *jpgBuf, size_t jpgLen);
 void camHwHandlePreviewRequest(WebServer &server);
 void camHwStartStreamServer(uint16_t port = 81);
 uint32_t camHwGetPreviewFrameSeq();
 bool camHwHasStreamClients();
+bool camHwNeedsPreviewJpeg(unsigned long nowMs);
 
 // Estimate mean scene luminance [0,1] from a camera frame buffer (RGB565 or grayscale).
 float camHwEstimateMeanLuma(const camera_fb_t *fb);
+
+// Estimate mean scene luminance [0,1] and localized motion using an 8x8 spatial block grid.
+// Cancels global AEC/AGC brightness shifts so low-light movement is reliably detected.
+float camHwAnalyzeSceneLumaAndMotion(const camera_fb_t *fb,
+                                     bool resetMotionBaseline,
+                                     float *outMotionScore,
+                                     bool *outMotionDetected);

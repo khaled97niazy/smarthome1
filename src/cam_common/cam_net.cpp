@@ -1,4 +1,5 @@
 #include "cam_net.h"
+#include "smart_home_json.h"
 
 #include <WiFi.h>
 #include <esp_now.h>
@@ -22,13 +23,15 @@ SemaphoreHandle_t s_netMutex = nullptr;
 bool s_espNowReady = false;
 bool s_hubPeerAdded = false;
 uint8_t s_hubBssid[6] = {0};
+uint8_t s_hubChannel = 0;
 
 volatile bool s_fallbackApActive = false;
+bool s_wasStaConnected = false;
 unsigned long s_bootMs = 0;
 unsigned long s_lastStaAttemptMs = 0;
 unsigned long s_lastHeartbeatMs = 0;
 
-volatile bool s_lastSendOk = false;
+volatile bool s_lastSendOk = true;
 volatile bool s_lastEventSendOk = false;
 volatile bool s_pendingTxIsHeartbeat = true;
 uint32_t s_seq = 0;
@@ -70,16 +73,24 @@ void syncHubPeerLocked() {
   const uint8_t *bssid = WiFi.BSSID();
   if (!isNonZeroMac(bssid)) return;
 
-  if (!s_hubPeerAdded || memcmp(s_hubBssid, bssid, 6) != 0) {
+  uint8_t curChannel = WiFi.channel();
+
+  if (!s_hubPeerAdded || memcmp(s_hubBssid, bssid, 6) != 0 || s_hubChannel != curChannel) {
     if (s_hubPeerAdded && esp_now_is_peer_exist(s_hubBssid)) {
       esp_now_del_peer(s_hubBssid);
     }
     memcpy(s_hubBssid, bssid, 6);
-    s_hubPeerAdded = ensurePeer(s_hubBssid, WIFI_IF_STA);
+    s_hubChannel = curChannel;
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, s_hubBssid, 6);
+    peer.channel = 0; // 0 = automatically follow active STA channel
+    peer.ifidx = WIFI_IF_STA;
+    peer.encrypt = false;
+    s_hubPeerAdded = (esp_now_add_peer(&peer) == ESP_OK);
     if (s_hubPeerAdded) {
-      Serial.printf("ESP-NOW Hub peer registered: %02X:%02X:%02X:%02X:%02X:%02X\n",
+      Serial.printf("ESP-NOW Hub peer registered: %02X:%02X:%02X:%02X:%02X:%02X (STA ch %d, auto-track)\n",
                     s_hubBssid[0], s_hubBssid[1], s_hubBssid[2],
-                    s_hubBssid[3], s_hubBssid[4], s_hubBssid[5]);
+                    s_hubBssid[3], s_hubBssid[4], s_hubBssid[5], curChannel);
     }
   }
 }
@@ -125,7 +136,9 @@ void camNetInit(SmartHomeNet::CamSource source) {
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.setAutoReconnect(true);
 
   const uint8_t *ipArr = (source == SmartHomeNet::CAM_SOURCE_FACE)
@@ -138,7 +151,8 @@ void camNetInit(SmartHomeNet::CamSource source) {
                    SmartHomeNet::SUBNET_MASK[2], SmartHomeNet::SUBNET_MASK[3]);
   WiFi.config(localIp, hubIp, subnet);
 
-  WiFi.begin(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS, SmartHomeNet::WIFI_CHANNEL);
+  // Dynamic channel scan: do not specify channel so STA scans all channels to find Hub
+  WiFi.begin(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS);
   s_lastStaAttemptMs = s_bootMs;
 
   if (esp_now_init() == ESP_OK) {
@@ -159,19 +173,26 @@ void camNetLoop() {
   }
 
   wl_status_t st = WiFi.status();
+  bool triggerImmediateHeartbeat = false;
   if (st == WL_CONNECTED) {
     stopFallbackApLocked();
     syncHubPeerLocked();
+    if (!s_wasStaConnected) {
+      s_wasStaConnected = true;
+      triggerImmediateHeartbeat = true;
+    }
   } else {
+    s_wasStaConnected = false;
     if (!s_fallbackApActive && (now - s_bootMs >= HUB_CONNECT_GRACE_MS)) {
       startFallbackApLocked();
     }
-    unsigned long retryMs = s_fallbackApActive ? STA_RETRY_FALLBACK_AP_MS : STA_RETRY_INTERVAL_MS;
+    bool hasApClients = s_fallbackApActive && (WiFi.softAPgetStationNum() > 0);
+    unsigned long retryMs = hasApClients ? STA_RETRY_FALLBACK_AP_MS : STA_RETRY_INTERVAL_MS;
     if (now - s_lastStaAttemptMs >= retryMs) {
       s_lastStaAttemptMs = now;
       // Avoid resetting SoftAP HTTP state with full WiFi.begin() while serving fallback clients
       if (!WiFi.reconnect()) {
-        WiFi.begin(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS, SmartHomeNet::WIFI_CHANNEL);
+        WiFi.begin(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS);
       }
     }
   }
@@ -180,11 +201,56 @@ void camNetLoop() {
     xSemaphoreGive(s_netMutex);
   }
 
-  if (now - s_lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+  if (triggerImmediateHeartbeat || (now - s_lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS)) {
     s_lastHeartbeatMs = now;
     camNetSendEvent(SmartHomeNet::CAM_EVENT_HEARTBEAT, 0, 100,
                     s_source == SmartHomeNet::CAM_SOURCE_FACE ? "FACE-CAM" : "PLATE-CAM");
   }
+}
+
+bool camNetPostHttpEvent(SmartHomeNet::CamEventType event,
+                         int16_t matchId,
+                         uint8_t confidence,
+                         const char *label,
+                         uint32_t seq) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClient client;
+  client.setTimeout(300);
+  if (!client.connect("192.168.4.1", 80, 250)) {
+    return false;
+  }
+
+  String safeLabel = smartHomeJsonEscape(label ? label : "none");
+  char jsonBody[160];
+  snprintf(jsonBody, sizeof(jsonBody),
+           "{\"source\":%d,\"event\":%d,\"matchId\":%d,\"confidence\":%u,\"seq\":%u,\"label\":\"%s\"}",
+           static_cast<int>(s_source),
+           static_cast<int>(event),
+           static_cast<int>(matchId),
+           static_cast<unsigned>(confidence),
+           static_cast<unsigned>(seq),
+           safeLabel.c_str());
+
+  char req[320];
+  int reqLen = snprintf(req, sizeof(req),
+                        "POST /api/cam/event HTTP/1.1\r\n"
+                        "Host: 192.168.4.1\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: %d\r\n"
+                        "Connection: close\r\n\r\n%s",
+                        static_cast<int>(strlen(jsonBody)), jsonBody);
+
+  size_t written = client.write(reinterpret_cast<const uint8_t *>(req), reqLen);
+  unsigned long waitStart = millis();
+  while (client.connected() && !client.available() && (millis() - waitStart < 80)) {
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  while (client.available()) {
+    client.read();
+  }
+  client.stop();
+  return written == static_cast<size_t>(reqLen);
 }
 
 bool camNetSendEvent(SmartHomeNet::CamEventType event,
@@ -232,10 +298,21 @@ bool camNetSendEvent(SmartHomeNet::CamEventType event,
     s_sentCount = s_sentCount + 1;
   }
 
+  uint32_t pktSeq = pkt.seq;
+
   if (s_netMutex) {
     xSemaphoreGive(s_netMutex);
   }
-  return err == ESP_OK;
+
+  // Dual-Path: for critical access events (RECOGNIZED or UNKNOWN), or if an ESP-NOW
+  // heartbeat failed while connected to Wi-Fi, send via HTTP POST to the Hub.
+  bool httpOk = false;
+  if (WiFi.status() == WL_CONNECTED &&
+      (event != SmartHomeNet::CAM_EVENT_HEARTBEAT || err != ESP_OK || !s_lastSendOk)) {
+    httpOk = camNetPostHttpEvent(event, matchId, confidence, label, pktSeq);
+  }
+
+  return (err == ESP_OK) || httpOk;
 }
 
 bool camNetHubConnected() {

@@ -9,6 +9,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_camera.h>
+#include <esp_partition.h>
 #include <fb_gfx.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -38,6 +39,11 @@ constexpr unsigned long UNKNOWN_COOLDOWN_MS = 4000;
 constexpr unsigned long ENROLL_TIMEOUT_MS = 12000;
 constexpr size_t MAX_PENDING_DELETES = 16;
 constexpr uint16_t STREAM_PORT = 81;
+constexpr uint8_t DEFAULT_AUTO_FLASH_DUTY = 64;
+constexpr unsigned long AUTO_FLASH_HOLD_MS = 5000;      // Turn off after 5s of no motion or face
+constexpr unsigned long FLASH_SETTLE_BLANK_MS = 800;    // Re-seed motion baseline after LED change
+constexpr float DARKNESS_LUMA_THRESH = 0.22f;           // Darkness threshold to trigger flash on motion
+constexpr float DAYLIGHT_LUMA_THRESH = 0.68f;           // Bright ambient threshold to turn flash off
 
 struct EnrolledEntry {
   int id;
@@ -59,6 +65,7 @@ struct FaceStatusSnapshot {
   bool modelReady = false;
   bool flashOk = false;
   bool faceDetected = false;
+  bool motionDetected = false;
   char faceQuality[16] = "NO_FACE"; // "READY", "TOO_FAR", "TOO_CLOSE", "OFF_CENTER", "NO_FACE"
   int faceBox[4] = {0, 0, 0, 0};    // x1, y1, x2, y2
   bool enrollPending = false;
@@ -83,6 +90,38 @@ Preferences prefs;
 WebServer server(80);
 
 SemaphoreHandle_t stateMutex = nullptr;
+SemaphoreHandle_t g_overlayMutex = nullptr;
+SemaphoreHandle_t g_aiStartSem = nullptr;
+
+constexpr size_t AI_FRAME_WIDTH = 240;
+constexpr size_t AI_FRAME_HEIGHT = 240;
+constexpr size_t AI_FRAME_BYTES = AI_FRAME_WIDTH * AI_FRAME_HEIGHT * 2;
+
+uint8_t *g_aiFrameBuf = nullptr;
+uint8_t *g_streamFrameBuf = nullptr;
+volatile bool g_aiBusy = false;
+volatile int g_aiFrameW = 240;
+volatile int g_aiFrameH = 240;
+volatile float g_aiSceneLuma = 0.0f;
+volatile float g_streamFps = 0.0f;
+volatile bool g_sensorCfgPending = false;
+volatile bool g_faceDetectedLive = false;
+volatile unsigned long g_lastFaceSeenMs = 0;
+
+struct CachedFaceBox {
+  int box[4];
+  int keypoint[10];
+  bool hasKeypoints = false;
+};
+
+struct CachedOverlayState {
+  std::vector<CachedFaceBox> faces;
+  int matchId = 0;
+  bool enrollActive = false;
+  unsigned long updatedAtMs = 0;
+};
+
+CachedOverlayState g_cachedOverlay;
 
 FaceStatusSnapshot g_status;
 FaceConfig g_pendingCfg;
@@ -100,10 +139,24 @@ uint16_t packRgb565Color(uint32_t bgr888) {
                                ((bgr888 << 8) & 0xF800));
 }
 
-void drawFaceOverlay(camera_fb_t *fb,
-                     const std::list<dl::detect::result_t> &results,
-                     int matchId,
-                     bool enrollActive) {
+void drawCachedOverlay(camera_fb_t *fb) {
+  if (!fb || !fb->buf || !g_overlayMutex) return;
+
+  std::vector<CachedFaceBox> faces;
+  int matchId = 0;
+  bool enrollActive = false;
+  unsigned long updatedAtMs = 0;
+
+  if (xSemaphoreTake(g_overlayMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    faces = g_cachedOverlay.faces;
+    matchId = g_cachedOverlay.matchId;
+    enrollActive = g_cachedOverlay.enrollActive;
+    updatedAtMs = g_cachedOverlay.updatedAtMs;
+    xSemaphoreGive(g_overlayMutex);
+  }
+
+  if (faces.empty() || (millis() - updatedAtMs > 900)) return;
+
   fb_data_t gfx = {};
   gfx.width = fb->width;
   gfx.height = fb->height;
@@ -121,8 +174,7 @@ void drawFaceOverlay(camera_fb_t *fb,
   }
   uint16_t color = packRgb565Color(bgr);
 
-  for (const auto &res : results) {
-    if (res.box.size() < 4) continue;
+  for (const auto &res : faces) {
     int x = constrain(res.box[0], 0, fb->width - 1);
     int y = constrain(res.box[1], 0, fb->height - 1);
     int x2 = constrain(res.box[2], 0, fb->width - 1);
@@ -143,16 +195,18 @@ void drawFaceOverlay(camera_fb_t *fb,
     fb_gfx_drawFastVLine(&gfx, x + w - 2, y, h, color);
 
     // 5-point facial landmarks (eyes, nose, mouth corners)
-    for (size_t j = 0; j + 1 < res.keypoint.size(); j += 2) {
-      int kx = constrain(res.keypoint[j], 0, fb->width - 3);
-      int ky = constrain(res.keypoint[j + 1], 0, fb->height - 3);
-      fb_gfx_fillRect(&gfx, kx, ky, 3, 3, color);
+    if (res.hasKeypoints) {
+      for (size_t j = 0; j + 1 < 10; j += 2) {
+        int kx = constrain(res.keypoint[j], 0, fb->width - 3);
+        int ky = constrain(res.keypoint[j + 1], 0, fb->height - 3);
+        fb_gfx_fillRect(&gfx, kx, ky, 3, 3, color);
+      }
     }
   }
 }
 
 void loadConfigFromNvs(FaceConfig &cfg) {
-  if (!prefs.begin("facecfg", true)) return;
+  if (!prefs.begin("facecfg", false)) return;
   cfg.thresh = prefs.getFloat("thresh", 0.55f);
   cfg.unknownConfirm = prefs.getInt("uconf", 2);
   cfg.armed = prefs.getBool("armed", true);
@@ -176,6 +230,82 @@ void saveConfigToNvs(const FaceConfig &cfg) {
   prefs.putBool("hmir", cfg.hmirror);
   prefs.putBool("vflip", cfg.vflip);
   prefs.end();
+}
+
+// Validates and loads the "fr" Flash partition used by ESP-DL's MFN112_1X_S8.
+// Binary layout written by mfn::MFN<int8_t>::write_ids_to_flash():
+//   offset 0 (int32_t): flash_key   = 0x016C9041 (23892033)
+//   offset 4 (int32_t): enrolledNum = 0 .. 29 (for a 64 KB partition)
+//   offset 8 (int32_t): embLen      = 512 (float elements per face embedding)
+//   offset 12 + i*36  : int32_t id (4B) + char name[32] (32B)
+//
+// Workaround for two bugs in precompiled libmfn.a:
+//   1) clear_id(true) writes offset 0 and offset 4, but leaves offset 8 (embLen)
+//      untouched (-1 on erased flash).
+//   2) When enrolledNum == 0 in flash and 0 in RAM on boot, check_partition()
+//      returns 0x016C9041 (!= 0), causing set_ids_from_flash() to read offset 8
+//      into this->emb_len and abort in dl::Tensor<float>::set_shape({ -1 }).
+bool initAndLoadFaceFlash(FaceRecognition112V1S8 &recognizer) {
+  constexpr int32_t FR_FLASH_MAGIC = 0x016C9041;
+  constexpr int32_t FR_EMB_LEN = 512;
+  constexpr int32_t FR_MAX_IDS = 29;
+
+  const esp_partition_t *frPart = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "fr");
+  if (!frPart) {
+    Serial.println("[FACE] WARNING: 'fr' flash partition not found; faces will not persist.");
+    return false;
+  }
+
+  if (recognizer.set_partition(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "fr") != 1) {
+    Serial.println("[FACE] WARNING: recognizer.set_partition('fr') failed.");
+    return false;
+  }
+
+  struct FrFlashHeader {
+    int32_t magic;
+    int32_t enrolledNum;
+    int32_t embLen;
+  } hdr = {-1, -1, -1};
+
+  bool headerValid = false;
+  if (esp_partition_read(frPart, 0, &hdr, sizeof(hdr)) == ESP_OK) {
+    if (hdr.magic == FR_FLASH_MAGIC &&
+        hdr.enrolledNum >= 0 && hdr.enrolledNum <= FR_MAX_IDS &&
+        hdr.embLen == FR_EMB_LEN) {
+      headerValid = true;
+      for (int32_t i = 0; i < hdr.enrolledNum; ++i) {
+        struct FrIdRecord {
+          int32_t id;
+          char name[32];
+        } rec = {-1, {0}};
+        size_t off = 12 + static_cast<size_t>(i) * sizeof(FrIdRecord);
+        if (esp_partition_read(frPart, off, &rec, sizeof(rec)) != ESP_OK ||
+            rec.id < 0 || rec.id > 1000 ||
+            memchr(rec.name, '\0', sizeof(rec.name)) == nullptr) {
+          headerValid = false;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!headerValid) {
+    Serial.printf("[FACE] Formatting 'fr' flash partition (magic=0x%08x count=%d embLen=%d)\n",
+                  static_cast<unsigned>(hdr.magic),
+                  static_cast<int>(hdr.enrolledNum),
+                  static_cast<int>(hdr.embLen));
+    recognizer.clear_id(false);
+    recognizer.write_ids_to_flash();
+    return true;
+  }
+
+  if (hdr.enrolledNum > 0) {
+    int loaded = recognizer.set_ids_from_flash();
+    Serial.printf("[FACE] Loaded %d enrolled face(s) from 'fr' partition (status=%d)\n",
+                  static_cast<int>(hdr.enrolledNum), loaded);
+  }
+  return true;
 }
 
 void syncEnrolledSnapshot(FaceRecognition112V1S8 &recognizer, FaceStatusSnapshot &snap) {
@@ -213,31 +343,397 @@ void sanitizeName(const String &raw, char *out, size_t outSize) {
   }
 }
 
+enum FaceGateStatus {
+  FACE_GATE_READY = 0,
+  FACE_GATE_TOO_FAR,
+  FACE_GATE_TOO_CLOSE,
+  FACE_GATE_OFF_CENTER,
+  FACE_GATE_BAD_POSE,
+  FACE_GATE_BLURRY
+};
+
+inline uint8_t sampleRgb565Luma8(const uint8_t *buf, int frameW, int x, int y) {
+  const uint8_t *p = buf + (static_cast<size_t>(y) * frameW + x) * 2;
+  uint16_t px = (static_cast<uint16_t>(p[0]) << 8) | static_cast<uint16_t>(p[1]);
+  uint8_t r = static_cast<uint8_t>((((px >> 11) & 0x1F) * 255 + 15) / 31);
+  uint8_t g = static_cast<uint8_t>((((px >> 5) & 0x3F) * 255 + 31) / 63);
+  uint8_t b = static_cast<uint8_t>(((px & 0x1F) * 255 + 15) / 31);
+  return static_cast<uint8_t>((77U * r + 150U * g + 29U * b) >> 8);
+}
+
+// Verifies that the detected face is at the right distance, centered within the frame,
+// upright/frontal according to MNP01 5-point landmarks, and sharp/well-exposed before
+// invoking the heavy MobileFaceNet neural network.
+FaceGateStatus verifyFaceClearAndPositioned(const uint8_t *rgb565Buf,
+                                            int frameW,
+                                            int frameH,
+                                            const dl::detect::result_t &face,
+                                            bool allowWideYawForEnroll,
+                                            char *outQuality,
+                                            size_t qualSize,
+                                            char *outResult,
+                                            size_t resSize) {
+  int x1 = constrain(face.box[0], 0, frameW - 1);
+  int y1 = constrain(face.box[1], 0, frameH - 1);
+  int x2 = constrain(face.box[2], 0, frameW - 1);
+  int y2 = constrain(face.box[3], 0, frameH - 1);
+  int boxW = x2 - x1;
+  int boxH = y2 - y1;
+  long area = static_cast<long>(boxW) * static_cast<long>(boxH);
+
+  // 1. Distance / resolution gate
+  if (area < 2400 || boxW < 46 || boxH < 46) {
+    strncpy(outQuality, "TOO_FAR", qualSize - 1);
+    snprintf(outResult, resSize, "MOVE CLOSER");
+    return FACE_GATE_TOO_FAR;
+  }
+  if (area > 34000) {
+    strncpy(outQuality, "TOO_CLOSE", qualSize - 1);
+    snprintf(outResult, resSize, "STEP BACK");
+    return FACE_GATE_TOO_CLOSE;
+  }
+
+  // 2. Position & frame-border margin gate
+  int faceCenterX = (x1 + x2) / 2;
+  int faceCenterY = (y1 + y2) / 2;
+  int dx = abs(faceCenterX - (frameW / 2));
+  int dy = abs(faceCenterY - (frameH / 2));
+  bool clipped = (x1 < 6 || y1 < 6 || x2 > frameW - 6 || y2 > frameH - 6);
+  if (clipped || dx > 48 || dy > 48) {
+    strncpy(outQuality, "OFF_CENTER", qualSize - 1);
+    snprintf(outResult, resSize, "CENTER FACE");
+    return FACE_GATE_OFF_CENTER;
+  }
+
+  // 3. 5-point landmark pose verification
+  // MNP01 keypoint order: (0,1)=left_eye, (2,3)=mouth_left, (4,5)=nose, (6,7)=right_eye, (8,9)=mouth_right
+  if (face.keypoint.size() >= 10) {
+    int eyeLx = face.keypoint[0];
+    int eyeLy = face.keypoint[1];
+    int mouthLx = face.keypoint[2];
+    int mouthLy = face.keypoint[3];
+    int noseX = face.keypoint[4];
+    int noseY = face.keypoint[5];
+    int eyeRx = face.keypoint[6];
+    int eyeRy = face.keypoint[7];
+    int mouthRx = face.keypoint[8];
+    int mouthRy = face.keypoint[9];
+
+    int absEyeDx = abs(eyeRx - eyeLx);
+    int absEyeDy = abs(eyeRy - eyeLy);
+    int eyeMidX = (eyeLx + eyeRx) / 2;
+    int eyeMidY = (eyeLy + eyeRy) / 2;
+    int mouthMidY = (mouthLy + mouthRy) / 2;
+    int noseYawOffset = abs(noseX - eyeMidX);
+
+    bool badEyeSpacing = (absEyeDx < 13);
+    bool badRollTilt = (absEyeDy * 5 > absEyeDx * 2); // > ~22 deg head tilt
+    bool badVerticalOrder = (noseY <= eyeMidY + 3) || (mouthMidY <= noseY + 2);
+    bool badYaw = allowWideYawForEnroll ? (noseYawOffset * 4 > absEyeDx * 3)
+                                        : (noseYawOffset * 5 > absEyeDx * 3);
+
+    if (badEyeSpacing || badRollTilt || badVerticalOrder || badYaw) {
+      strncpy(outQuality, "BAD_POSE", qualSize - 1);
+      snprintf(outResult, resSize, "LOOK STRAIGHT");
+      return FACE_GATE_BAD_POSE;
+    }
+  }
+
+  // 4. Face ROI sharpness (gradient energy) & exposure contrast check
+  if (rgb565Buf) {
+    int rx1 = constrain(x1 + boxW / 6, 1, frameW - 4);
+    int ry1 = constrain(y1 + boxH / 6, 1, frameH - 4);
+    int rx2 = constrain(x2 - boxW / 6, rx1 + 4, frameW - 3);
+    int ry2 = constrain(y2 - boxH / 6, ry1 + 4, frameH - 3);
+
+    uint32_t lumaSum = 0;
+    uint32_t gradSum = 0;
+    uint32_t samples = 0;
+    uint8_t minL = 255;
+    uint8_t maxL = 0;
+
+    for (int y = ry1; y < ry2; y += 3) {
+      for (int x = rx1; x < rx2; x += 3) {
+        uint8_t c = sampleRgb565Luma8(rgb565Buf, frameW, x, y);
+        uint8_t cx = sampleRgb565Luma8(rgb565Buf, frameW, x + 2, y);
+        uint8_t cy = sampleRgb565Luma8(rgb565Buf, frameW, x, y + 2);
+        lumaSum += c;
+        if (c < minL) minL = c;
+        if (c > maxL) maxL = c;
+        gradSum += static_cast<uint32_t>(abs(static_cast<int>(cx) - static_cast<int>(c)) +
+                                         abs(static_cast<int>(cy) - static_cast<int>(c)));
+        samples++;
+      }
+    }
+
+    if (samples > 0) {
+      float meanLuma = static_cast<float>(lumaSum) / static_cast<float>(samples);
+      float meanGrad = static_cast<float>(gradSum) / static_cast<float>(samples);
+      int dynRange = static_cast<int>(maxL) - static_cast<int>(minL);
+      if (meanLuma < 18.0f || meanLuma > 246.0f || dynRange < 22 || meanGrad < 3.4f) {
+        strncpy(outQuality, "BLURRY", qualSize - 1);
+        snprintf(outResult, resSize, "HOLD STEADY");
+        return FACE_GATE_BLURRY;
+      }
+    }
+  }
+
+  strncpy(outQuality, "READY", qualSize - 1);
+  snprintf(outResult, resSize, "VERIFYING");
+  return FACE_GATE_READY;
+}
+
+// Dedicated ESP-WHO style camera capture & MJPEG stream producer task on Core 0.
+// Grabs 240x240 RGB565 frames at full camera rate (~15-18 FPS), selectively hands
+// motion/settled frames to the Core 1 AI worker, overlays the latest cached face
+// bounding box/landmarks, and encodes JPEG on demand.
+void camCaptureTask(void * /*param*/) {
+  FaceConfig capCfg;
+  if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
+    capCfg = g_status.cfg;
+    xSemaphoreGive(stateMutex);
+  }
+
+  uint8_t currentDuty = capCfg.flashAuto ? 0 : capCfg.flashDuty;
+  bool flashOn = (!capCfg.flashAuto && capCfg.flashDuty > 0);
+  int fbNullStreak = 0;
+  uint32_t lumaCounter = 0;
+  uint32_t aiSkipCounter = 0;
+  uint32_t streamEncodeToggle = 0;
+  unsigned long lastAiHandoffMs = 0;
+  float sceneLuma = 0.5f;
+  float motionScore = 0.0f;
+  bool motionRecent = false;
+  unsigned long lastMotionMs = 0;
+  unsigned long lastActivityMs = millis();
+  unsigned long flashSettleUntilMs = millis() + FLASH_SETTLE_BLANK_MS;
+
+  uint32_t streamFrames = 0;
+  unsigned long streamFpsLastMs = millis();
+
+  while (true) {
+    if (g_sensorCfgPending) {
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        capCfg = g_status.cfg;
+        g_sensorCfgPending = false;
+        xSemaphoreGive(stateMutex);
+      }
+      uint8_t autoDuty = (capCfg.flashDuty > 0) ? capCfg.flashDuty : DEFAULT_AUTO_FLASH_DUTY;
+      uint8_t targetDuty = capCfg.flashAuto ? (flashOn ? autoDuty : 0) : capCfg.flashDuty;
+      camHwApplySensorSettings(capCfg.hmirror, capCfg.vflip, targetDuty);
+      currentDuty = targetDuty;
+      flashSettleUntilMs = millis() + FLASH_SETTLE_BLANK_MS;
+      // Flush 2 frames after sensor register update so mid-frame RGB565 changes are discarded
+      for (int i = 0; i < 2; ++i) {
+        camera_fb_t *flushFb = esp_camera_fb_get();
+        if (flushFb) esp_camera_fb_return(flushFb);
+      }
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      fbNullStreak++;
+      if (fbNullStreak >= 50) {
+        Serial.printf("[FACE] Warning: esp_camera_fb_get stalled (streak %d); re-initializing OV2640...\n",
+                      fbNullStreak);
+        if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
+          g_status.cameraReady = false;
+          xSemaphoreGive(stateMutex);
+        }
+        esp_camera_deinit();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        bool camOk = camHwInitCamera(PIXFORMAT_RGB565,
+                                     FRAMESIZE_240X240,
+                                     12,
+                                     capCfg.hmirror,
+                                     capCfg.vflip);
+        if (camOk) {
+          camHwSetFlashLed(currentDuty);
+          flashSettleUntilMs = millis() + FLASH_SETTLE_BLANK_MS;
+        }
+        if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
+          g_status.cameraReady = camOk;
+          xSemaphoreGive(stateMutex);
+        }
+        fbNullStreak = 0;
+      }
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    fbNullStreak = 0;
+
+    // Discard any corrupted/incomplete DMA frame whose byte length does not match 240x240 RGB565
+    if (fb->len != AI_FRAME_BYTES || fb->width != AI_FRAME_WIDTH || fb->height != AI_FRAME_HEIGHT) {
+      esp_camera_fb_return(fb);
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
+    unsigned long now = millis();
+    size_t frameLen = fb->len;
+    size_t frameW = fb->width;
+    size_t frameH = fb->height;
+    pixformat_t frameFmt = fb->format;
+
+    // Copy frame into PSRAM working buffer and immediately release DMA framebuffer (<2 ms hold)
+    if (g_streamFrameBuf) {
+      memcpy(g_streamFrameBuf, fb->buf, frameLen);
+    }
+    esp_camera_fb_return(fb);
+    fb = nullptr;
+
+    camera_fb_t localFb = {};
+    localFb.buf = g_streamFrameBuf;
+    localFb.len = frameLen;
+    localFb.width = frameW;
+    localFb.height = frameH;
+    localFb.format = frameFmt;
+
+    bool sampleLuma = ((lumaCounter++ % 2U) == 0U);
+    bool motionNow = false;
+    bool inSettleWindow = (now < flashSettleUntilMs);
+
+    // Analyze scene luma & localized motion outside DMA hold.
+    // Auto-flash turns ON when there is darkness AND motion (or face/enroll),
+    // and turns OFF after 5 seconds of no motion and no face.
+    if (sampleLuma && localFb.buf) {
+      sceneLuma = camHwAnalyzeSceneLumaAndMotion(&localFb,
+                                                 inSettleWindow,
+                                                 &motionScore,
+                                                 &motionNow);
+      if (motionNow) {
+        lastMotionMs = now;
+      }
+      motionRecent = (lastMotionMs != 0) && ((now - lastMotionMs) < 1200);
+      bool facePresent = g_faceDetectedLive && ((now - g_lastFaceSeenMs) < 1500);
+      bool enrollActive = g_enrollPending;
+
+      if (motionNow || facePresent || enrollActive) {
+        lastActivityMs = now;
+      }
+
+      uint8_t autoDuty = (capCfg.flashDuty > 0) ? capCfg.flashDuty : DEFAULT_AUTO_FLASH_DUTY;
+      if (capCfg.flashAuto) {
+        if (!flashOn) {
+          // Turn light ON when scene is dark AND motion (or face/enrollment) is detected
+          if (sceneLuma < DARKNESS_LUMA_THRESH && (motionNow || facePresent || enrollActive)) {
+            flashOn = true;
+            lastActivityMs = now;
+            flashSettleUntilMs = now + FLASH_SETTLE_BLANK_MS;
+            inSettleWindow = true;
+            camHwSetFlashLed(autoDuty);
+            currentDuty = autoDuty;
+            Serial.printf("[FACE] Auto-flash ON (luma=%.2f motion=%d face=%d)\n",
+                          sceneLuma, motionNow ? 1 : 0, facePresent ? 1 : 0);
+          }
+        } else {
+          // Turn light OFF after 5 seconds of no motion and no face (or if bright daylight returns)
+          if (((now - lastActivityMs) >= AUTO_FLASH_HOLD_MS) ||
+              (sceneLuma > DAYLIGHT_LUMA_THRESH && !enrollActive)) {
+            flashOn = false;
+            flashSettleUntilMs = now + FLASH_SETTLE_BLANK_MS;
+            inSettleWindow = true;
+            camHwSetFlashLed(0);
+            currentDuty = 0;
+            Serial.println("[FACE] Auto-flash OFF (no motion or face for 5s)");
+          } else if (autoDuty != currentDuty) {
+            camHwSetFlashLed(autoDuty);
+            currentDuty = autoDuty;
+            flashSettleUntilMs = now + FLASH_SETTLE_BLANK_MS;
+            inSettleWindow = true;
+          }
+        }
+      } else {
+        flashOn = (capCfg.flashDuty > 0);
+        if (capCfg.flashDuty != currentDuty) {
+          camHwSetFlashLed(capCfg.flashDuty);
+          currentDuty = capCfg.flashDuty;
+          flashSettleUntilMs = now + FLASH_SETTLE_BLANK_MS;
+          inSettleWindow = true;
+        }
+      }
+    }
+
+    // Selective Frame Handoff to Core 1 AI worker:
+    // - Do NOT pass every frame to the detector.
+    // - Skip frames during LED exposure settling or extreme darkness/whiteout.
+    // - When motion, face tracking, or enrollment is active: pass 1 of every 2 frames (>=110 ms apart).
+    // - When scene is static (no motion & no face): pass only 1 frame every 650 ms.
+    aiSkipCounter++;
+    bool facePresent = g_faceDetectedLive && ((now - g_lastFaceSeenMs) < 1500);
+    bool sceneActive = g_enrollPending || facePresent || motionNow || motionRecent;
+    uint32_t minSkipFrames = sceneActive ? 2U : 10U;
+    unsigned long minIntervalMs = sceneActive ? 110UL : 650UL;
+    bool instantWakeOnMotion = (motionNow && !facePresent && (now - lastAiHandoffMs >= 90UL));
+
+    bool handoffToAi = (!g_aiBusy &&
+                        g_aiFrameBuf &&
+                        g_streamFrameBuf &&
+                        !inSettleWindow &&
+                        sceneLuma >= 0.03f &&
+                        sceneLuma <= 0.96f &&
+                        ((aiSkipCounter >= minSkipFrames && (now - lastAiHandoffMs >= minIntervalMs)) ||
+                         instantWakeOnMotion));
+
+    if (handoffToAi) {
+      memcpy(g_aiFrameBuf, g_streamFrameBuf, frameLen);
+      g_aiFrameW = static_cast<int>(frameW);
+      g_aiFrameH = static_cast<int>(frameH);
+      g_aiSceneLuma = sceneLuma;
+      g_aiBusy = true;
+      aiSkipCounter = 0;
+      lastAiHandoffMs = now;
+      if (g_aiStartSem) {
+        xSemaphoreGive(g_aiStartSem);
+      }
+    }
+
+    // While Core 1 is actively running neural network inference on PSRAM (g_aiBusy),
+    // pace JPEG encoding to every 2nd capture iteration to reduce PSRAM bus contention.
+    bool needJpeg = camHwNeedsPreviewJpeg(now) && g_streamFrameBuf;
+    if (needJpeg && g_aiBusy && camHwHasStreamClients()) {
+      needJpeg = ((streamEncodeToggle++ & 1U) == 0U);
+    }
+    if (needJpeg) {
+      drawCachedOverlay(&localFb);
+      uint8_t jpgQuality = camHwHasStreamClients() ? 54 : 64;
+      camHwUpdatePreviewJpeg(&localFb, PIXFORMAT_RGB565, jpgQuality);
+    }
+
+    streamFrames++;
+    if (now - streamFpsLastMs >= 1000) {
+      g_streamFps = (streamFrames * 1000.0f) / (now - streamFpsLastMs);
+      streamFrames = 0;
+      streamFpsLastMs = now;
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        g_status.cameraReady = true;
+        g_status.fps = g_streamFps;
+        g_status.sceneLuma = sceneLuma;
+        g_status.motionDetected = motionRecent;
+        g_status.flashDutyApplied = currentDuty;
+        xSemaphoreGive(stateMutex);
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(camHwHasStreamClients() ? 8 : 20));
+  }
+}
+
 void faceWorkerTask(void * /*param*/) {
   FaceConfig activeCfg;
   if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
     activeCfg = g_status.cfg;
     xSemaphoreGive(stateMutex);
   }
-  uint8_t currentDuty = activeCfg.flashDuty;
 
-  HumanFaceDetectMSR01 s1(0.1F, 0.5F, 10, 0.2F);
-  HumanFaceDetectMNP01 s2(0.5F, 0.3F, 5);
+  // Optimized 2-stage face detector thresholds:
+  // MSR01 score_threshold=0.30, nms=0.40, top_k=3 avoids evaluating up to 10 weak background
+  // candidates in Stage 2 (MNP01), cutting detection time significantly.
+  HumanFaceDetectMSR01 s1(0.30F, 0.40F, 3, 0.2F);
+  HumanFaceDetectMNP01 s2(0.55F, 0.30F, 2);
   FaceRecognition112V1S8 recognizer;
 
-  bool flashOk = false;
-  if (recognizer.set_partition(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "fr") == 1) {
-    int partStatus = recognizer.check_partition();
-    if (partStatus >= 0) {
-      recognizer.set_ids_from_flash();
-    } else {
-      Serial.printf("Initializing blank 'fr' flash partition (status=%d)\n", partStatus);
-      recognizer.clear_id(true);
-    }
-    flashOk = (recognizer.check_partition() >= 0);
-  } else {
-    Serial.println("WARNING: 'fr' flash partition not found; faces will not persist.");
-  }
+  bool flashOk = initAndLoadFaceFlash(recognizer);
 
   recognizer.set_thresh(activeCfg.thresh);
 
@@ -257,16 +753,22 @@ void faceWorkerTask(void * /*param*/) {
   unsigned long lastRecognizedSentMs = 0;
   unsigned long lastUnknownSentMs = 0;
 
-  uint32_t fpsFrames = 0;
-  unsigned long fpsLastMs = millis();
-  float currentFps = 0.0f;
-
-  // Auto-flash hysteresis state.
-  bool flashOn = false;
-  // Consecutive empty frame grabs; triggers camera re-init when high.
-  int fbNullStreak = 0;
+  // ESP-WHO temporal face tracking state to skip redundant MobileFaceNet passes
+  int trackedId = -1;
+  char trackedName[24] = "---";
+  float trackedSim = 0.0f;
+  int trackedCx = -1000;
+  int trackedCy = -1000;
+  long trackedArea = 0;
+  unsigned long lastFullRecogMs = 0;
 
   while (true) {
+    if (g_aiStartSem) {
+      xSemaphoreTake(g_aiStartSem, pdMS_TO_TICKS(25));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(25));
+    }
+
     std::vector<int> deleteIds;
     bool doClear = false;
     bool doApplyCfg = false;
@@ -288,6 +790,7 @@ void faceWorkerTask(void * /*param*/) {
         activeCfg = g_pendingCfg;
         g_status.cfg = activeCfg;
         g_applyCfgPending = false;
+        g_sensorCfgPending = true;
         doApplyCfg = true;
       }
       if (g_enrollPending) {
@@ -313,8 +816,10 @@ void faceWorkerTask(void * /*param*/) {
     }
 
     if (doClear) {
-      recognizer.clear_id(true);
+      recognizer.clear_id(false);
+      recognizer.write_ids_to_flash();
       unknownStreak = 0;
+      trackedId = -1;
       Serial.println("Cleared all enrolled faces from Flash.");
       if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
         syncEnrolledSnapshot(recognizer, g_status);
@@ -325,10 +830,12 @@ void faceWorkerTask(void * /*param*/) {
 
     if (!deleteIds.empty()) {
       for (int id : deleteIds) {
-        recognizer.delete_id(id, true);
+        recognizer.delete_id(id, false);
         Serial.printf("Deleted face ID #%d from Flash.\n", id);
       }
+      recognizer.write_ids_to_flash();
       unknownStreak = 0;
+      trackedId = -1;
       if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
         syncEnrolledSnapshot(recognizer, g_status);
         if (deleteIds.size() == 1) {
@@ -344,78 +851,42 @@ void faceWorkerTask(void * /*param*/) {
 
     if (doApplyCfg) {
       recognizer.set_thresh(activeCfg.thresh);
-      camHwApplySensorSettings(activeCfg.hmirror, activeCfg.vflip, activeCfg.flashDuty);
+      trackedId = -1;
       saveConfigToNvs(activeCfg);
-      Serial.printf("Updated settings: thresh=%.2f armed=%d uconf=%d flash=%u\n",
-                    activeCfg.thresh, activeCfg.armed, activeCfg.unknownConfirm, activeCfg.flashDuty);
+      Serial.printf("Updated settings: thresh=%.2f armed=%d uconf=%d flash=%u auto=%d\n",
+                    activeCfg.thresh, activeCfg.armed, activeCfg.unknownConfirm,
+                    activeCfg.flashDuty, activeCfg.flashAuto);
     }
 
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-      fbNullStreak++;
-      if (fbNullStreak >= 25) { // ~1 s of empty grabs -> reinitialize OV2640
-        Serial.println("[FACE] Camera frame grab stalled; re-initializing OV2640...");
-        if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
-          g_status.cameraReady = false;
-          xSemaphoreGive(stateMutex);
-        }
-        esp_camera_deinit();
-        bool camOk = camHwInitCamera(PIXFORMAT_RGB565,
-                                     FRAMESIZE_240X240,
-                                     12,
-                                     activeCfg.hmirror,
-                                     activeCfg.vflip);
-        if (camOk) {
-          camHwSetFlashLed(activeCfg.flashAuto ? (flashOn ? activeCfg.flashDuty : 0)
-                                               : activeCfg.flashDuty);
-        }
-        if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
-          g_status.cameraReady = camOk;
-          xSemaphoreGive(stateMutex);
-        }
-        fbNullStreak = 0;
-      }
-      vTaskDelay(pdMS_TO_TICKS(40));
+    if (!g_aiBusy || !g_aiFrameBuf) {
       continue;
     }
-    fbNullStreak = 0;
-    if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
-      g_status.cameraReady = true;
-      xSemaphoreGive(stateMutex);
-    }
 
+    int frameW = g_aiFrameW;
+    int frameH = g_aiFrameH;
+    float sceneLuma = g_aiSceneLuma;
     unsigned long tStart = millis();
-    float sceneLuma = camHwEstimateMeanLuma(fb);
 
-    // Auto-flash with hysteresis: turn LED on in low light, off when bright.
-    uint8_t duty = activeCfg.flashDuty;
-    if (activeCfg.flashAuto) {
-      if (!flashOn && sceneLuma < 0.18f) {
-        flashOn = true;
-        duty = activeCfg.flashDuty;
-      } else if (flashOn && sceneLuma > 0.40f) {
-        flashOn = false;
-        duty = 0;
+    std::vector<int> imgShape = {frameH, frameW, 3};
+    std::list<dl::detect::result_t> &candidates =
+        s1.infer(reinterpret_cast<uint16_t *>(g_aiFrameBuf), imgShape);
+
+    // Pre-filter Stage 1 candidates: remove tiny/invalid boxes (<36x36) before Stage 2 (MNP01)
+    for (auto it = candidates.begin(); it != candidates.end();) {
+      if (it->box.size() < 4 ||
+          (it->box[2] - it->box[0]) < 36 ||
+          (it->box[3] - it->box[1]) < 36) {
+        it = candidates.erase(it);
       } else {
-        duty = flashOn ? activeCfg.flashDuty : 0;
-      }
-      if (duty != currentDuty) {
-        camHwSetFlashLed(duty);
-        currentDuty = duty;
-      }
-    } else {
-      flashOn = (activeCfg.flashDuty > 0);
-      if (activeCfg.flashDuty != currentDuty) {
-        camHwSetFlashLed(activeCfg.flashDuty);
-        currentDuty = activeCfg.flashDuty;
+        ++it;
       }
     }
 
-    std::vector<int> imgShape = {static_cast<int>(fb->height), static_cast<int>(fb->width), 3};
-    std::list<dl::detect::result_t> &candidates =
-        s1.infer(reinterpret_cast<uint16_t *>(fb->buf), imgShape);
+    std::list<dl::detect::result_t> emptyResults;
     std::list<dl::detect::result_t> &results =
-        s2.infer(reinterpret_cast<uint16_t *>(fb->buf), imgShape, candidates);
+        candidates.empty()
+            ? emptyResults
+            : s2.infer(reinterpret_cast<uint16_t *>(g_aiFrameBuf), imgShape, candidates);
 
     // Pick largest face with 5-point facial landmarks
     const dl::detect::result_t *bestFace = nullptr;
@@ -431,6 +902,10 @@ void faceWorkerTask(void * /*param*/) {
 
     int overlayState = 0;
     bool detected = (bestFace != nullptr);
+    g_faceDetectedLive = detected;
+    if (detected) {
+      g_lastFaceSeenMs = millis();
+    }
     int matchedId = -1;
     float similarity = 0.0f;
     char matchedName[24] = "---";
@@ -440,116 +915,179 @@ void faceWorkerTask(void * /*param*/) {
     bool enrolledNow = false;
     int enrolledNewId = -1;
     bool enrollAttempted = false;
+    FaceGateStatus faceGate = FACE_GATE_TOO_FAR;
 
     if (bestFace) {
-      faceBox[0] = constrain(bestFace->box[0], 0, fb->width - 1);
-      faceBox[1] = constrain(bestFace->box[1], 0, fb->height - 1);
-      faceBox[2] = constrain(bestFace->box[2], 0, fb->width - 1);
-      faceBox[3] = constrain(bestFace->box[3], 0, fb->height - 1);
+      faceBox[0] = constrain(bestFace->box[0], 0, frameW - 1);
+      faceBox[1] = constrain(bestFace->box[1], 0, frameH - 1);
+      faceBox[2] = constrain(bestFace->box[2], 0, frameW - 1);
+      faceBox[3] = constrain(bestFace->box[3], 0, frameH - 1);
       int faceCenterX = (faceBox[0] + faceBox[2]) / 2;
       int faceCenterY = (faceBox[1] + faceBox[3]) / 2;
 
-      int dx = faceCenterX - static_cast<int>(fb->width / 2);
-      int dy = faceCenterY - static_cast<int>(fb->height / 2);
-      if (dx < 0) dx = -dx;
-      if (dy < 0) dy = -dy;
-
-      if (bestArea < 2400) {
-        strncpy(qualityLabel, "TOO_FAR", sizeof(qualityLabel) - 1);
-      } else if (bestArea > 33000) {
-        strncpy(qualityLabel, "TOO_CLOSE", sizeof(qualityLabel) - 1);
-      } else if (dx > 48 || dy > 48) {
-        strncpy(qualityLabel, "OFF_CENTER", sizeof(qualityLabel) - 1);
-      } else {
-        strncpy(qualityLabel, "READY", sizeof(qualityLabel) - 1);
-      }
+      // Verify face is clear, sharp, frontal, and properly positioned BEFORE running MobileFaceNet
+      faceGate = verifyFaceClearAndPositioned(g_aiFrameBuf,
+                                              frameW,
+                                              frameH,
+                                              *bestFace,
+                                              enrollActive,
+                                              qualityLabel,
+                                              sizeof(qualityLabel),
+                                              resultLabel,
+                                              sizeof(resultLabel));
 
       std::vector<int> landmarks = bestFace->keypoint;
       if (enrollActive) {
-        // Enroll face with valid landmarks
-        enrollAttempted = true;
-        enrolledNewId = recognizer.enroll_id(reinterpret_cast<uint16_t *>(fb->buf),
-                                             imgShape,
-                                             landmarks,
-                                             std::string(enrollTarget),
-                                             true);
-        enrolledNow = (enrolledNewId >= 0);
-        overlayState = enrolledNewId;
-        snprintf(resultLabel, sizeof(resultLabel), enrolledNow ? "ENROLLED" : "ENROLL ERR");
-        if (enrolledNow) {
-          matchedId = enrolledNewId;
-          strncpy(matchedName, enrollTarget, sizeof(matchedName) - 1);
-          similarity = 1.0f;
+        if (faceGate != FACE_GATE_READY) {
+          overlayState = 0;
+        } else {
+          // Enroll only when face is verified clear and properly positioned
+          enrollAttempted = true;
+          enrolledNewId = recognizer.enroll_id(reinterpret_cast<uint16_t *>(g_aiFrameBuf),
+                                               imgShape,
+                                               landmarks,
+                                               std::string(enrollTarget),
+                                               true);
+          enrolledNow = (enrolledNewId >= 0);
+          overlayState = enrolledNewId;
+          snprintf(resultLabel, sizeof(resultLabel), enrolledNow ? "ENROLLED" : "ENROLL ERR");
+          if (enrolledNow) {
+            matchedId = enrolledNewId;
+            strncpy(matchedName, enrollTarget, sizeof(matchedName) - 1);
+            matchedName[sizeof(matchedName) - 1] = '\0';
+            similarity = 1.0f;
+            trackedId = enrolledNewId;
+            strncpy(trackedName, matchedName, sizeof(trackedName) - 1);
+            trackedName[sizeof(trackedName) - 1] = '\0';
+            trackedSim = 1.0f;
+            trackedCx = faceCenterX;
+            trackedCy = faceCenterY;
+            trackedArea = bestArea;
+            lastFullRecogMs = millis();
+            lastRecognizedSentMs = lastFullRecogMs;
+            camNetSendEvent(SmartHomeNet::CAM_EVENT_RECOGNIZED,
+                            static_cast<int16_t>(enrolledNewId),
+                            100,
+                            matchedName);
+          }
+          unknownStreak = 0;
         }
-        unknownStreak = 0;
       } else {
-        face_info_t info = recognizer.recognize(reinterpret_cast<uint16_t *>(fb->buf),
-                                                imgShape,
-                                                landmarks);
-        matchedId = info.id;
-        similarity = info.similarity;
-
         unsigned long now = millis();
+        int dcx = abs(faceCenterX - trackedCx);
+        int dcy = abs(faceCenterY - trackedCy);
+        long areaDiff = labs(bestArea - trackedArea);
+        bool canReuseTrack = (trackedId >= 0) &&
+                             (now - lastFullRecogMs < 1800) &&
+                             (dcx < 36 && dcy < 36) &&
+                             (trackedArea > 0 && areaDiff * 3 < trackedArea);
+
+        if (canReuseTrack) {
+          matchedId = trackedId;
+          similarity = trackedSim;
+          strncpy(matchedName, trackedName, sizeof(matchedName) - 1);
+          matchedName[sizeof(matchedName) - 1] = '\0';
+          trackedCx = faceCenterX;
+          trackedCy = faceCenterY;
+          trackedArea = bestArea;
+        } else if (faceGate == FACE_GATE_READY) {
+          // Run MobileFaceNet neural network ONLY when face is clear and properly positioned
+          face_info_t info = recognizer.recognize(reinterpret_cast<uint16_t *>(g_aiFrameBuf),
+                                                  imgShape,
+                                                  landmarks);
+          matchedId = info.id;
+          similarity = info.similarity;
+          now = millis();
+          if (info.id >= 0) {
+            if (info.name.empty()) {
+              snprintf(matchedName, sizeof(matchedName), "ID-%d", info.id);
+            } else {
+              strncpy(matchedName, info.name.c_str(), sizeof(matchedName) - 1);
+              matchedName[sizeof(matchedName) - 1] = '\0';
+            }
+            trackedId = info.id;
+            strncpy(trackedName, matchedName, sizeof(trackedName) - 1);
+            trackedName[sizeof(trackedName) - 1] = '\0';
+            trackedSim = similarity;
+            trackedCx = faceCenterX;
+            trackedCy = faceCenterY;
+            trackedArea = bestArea;
+            lastFullRecogMs = now;
+          } else {
+            trackedId = -1;
+          }
+        }
+
         uint8_t confPct = static_cast<uint8_t>(constrain(lroundf(similarity * 100.0f), 0L, 100L));
 
-        if (info.id >= 0) {
+        if (matchedId >= 0) {
           unknownStreak = 0;
-          overlayState = info.id;
+          overlayState = matchedId;
           snprintf(resultLabel, sizeof(resultLabel), "RECOGNIZED");
-          if (info.name.empty()) {
-            snprintf(matchedName, sizeof(matchedName), "ID-%d", info.id);
-          } else {
-            strncpy(matchedName, info.name.c_str(), sizeof(matchedName) - 1);
-            matchedName[sizeof(matchedName) - 1] = '\0';
-          }
           camHwSetStatusLed(true);
 
           if (now - lastRecognizedSentMs >= RECOGNIZED_COOLDOWN_MS) {
             lastRecognizedSentMs = now;
             camNetSendEvent(SmartHomeNet::CAM_EVENT_RECOGNIZED,
-                            static_cast<int16_t>(info.id),
+                            static_cast<int16_t>(matchedId),
                             confPct,
                             matchedName);
             Serial.printf("[FACE] RECOGNIZED id=%d name=\"%s\" sim=%.2f\n",
-                          info.id, matchedName, similarity);
+                          matchedId, matchedName, similarity);
           }
+        } else if (faceGate != FACE_GATE_READY) {
+          // Face detected, but not yet clear/centered: skip MobileFaceNet & guide user
+          overlayState = 0;
+          camHwSetStatusLed(false);
         } else {
-          overlayState = -2;
-          snprintf(resultLabel, sizeof(resultLabel), "UNKNOWN");
-          snprintf(matchedName, sizeof(matchedName), "Unknown");
+          camHwSetStatusLed(false);
           unknownStreak++;
+          snprintf(matchedName, sizeof(matchedName), "Unknown");
 
-          if (activeCfg.armed &&
-              unknownStreak >= activeCfg.unknownConfirm &&
-              (now - lastUnknownSentMs >= UNKNOWN_COOLDOWN_MS)) {
-            lastUnknownSentMs = now;
-            camNetSendEvent(SmartHomeNet::CAM_EVENT_UNKNOWN, -1, confPct, "UNKNOWN");
-            Serial.printf("[FACE] UNKNOWN INTRUDER ALERT (sim=%.2f streak=%d)\n",
-                          similarity, unknownStreak);
+          if (unknownStreak >= activeCfg.unknownConfirm) {
+            overlayState = -2;
+            snprintf(resultLabel, sizeof(resultLabel), "UNKNOWN");
+            if (activeCfg.armed && (now - lastUnknownSentMs >= UNKNOWN_COOLDOWN_MS)) {
+              lastUnknownSentMs = now;
+              camNetSendEvent(SmartHomeNet::CAM_EVENT_UNKNOWN, -1, confPct, "UNKNOWN");
+              Serial.printf("[FACE] UNKNOWN INTRUDER ALERT (sim=%.2f streak=%d)\n",
+                            similarity, unknownStreak);
+            }
+          } else {
+            overlayState = 0; // Yellow calibrating reticle until streak confirmed
+            snprintf(resultLabel, sizeof(resultLabel), "VERIFYING");
           }
         }
       }
     } else {
       unknownStreak = 0;
+      trackedId = -1;
       camHwSetStatusLed(false);
     }
 
     unsigned long elapsedMs = millis() - tStart;
 
-    if (!results.empty()) {
-      drawFaceOverlay(fb, results, overlayState, enrollActive);
+    // Publish latest face overlay to Core 0 capture/stream task
+    if (g_overlayMutex && xSemaphoreTake(g_overlayMutex, pdMS_TO_TICKS(15)) == pdTRUE) {
+      g_cachedOverlay.faces.clear();
+      for (const auto &res : results) {
+        if (res.box.size() < 4) continue;
+        CachedFaceBox cb = {};
+        for (int i = 0; i < 4; ++i) cb.box[i] = res.box[i];
+        if (res.keypoint.size() >= 10) {
+          cb.hasKeypoints = true;
+          for (int i = 0; i < 10; ++i) cb.keypoint[i] = res.keypoint[i];
+        }
+        g_cachedOverlay.faces.push_back(cb);
+      }
+      g_cachedOverlay.matchId = overlayState;
+      g_cachedOverlay.enrollActive = enrollActive;
+      g_cachedOverlay.updatedAtMs = millis();
+      xSemaphoreGive(g_overlayMutex);
     }
-    camHwUpdatePreviewJpeg(fb, PIXFORMAT_RGB565, 68);
-    esp_camera_fb_return(fb);
 
-    // Real-time inference FPS tracking
-    fpsFrames++;
-    unsigned long nowMs = millis();
-    if (nowMs - fpsLastMs >= 1000) {
-      currentFps = (fpsFrames * 1000.0f) / (nowMs - fpsLastMs);
-      fpsFrames = 0;
-      fpsLastMs = nowMs;
-    }
+    // Release AI frame buffer so camCaptureTask can hand off the next live frame
+    g_aiBusy = false;
 
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
       g_status.faceDetected = detected;
@@ -558,10 +1096,9 @@ void faceWorkerTask(void * /*param*/) {
       g_status.lastMatchId = matchedId;
       g_status.lastSimilarity = similarity;
       g_status.inferenceMs = static_cast<uint32_t>(elapsedMs);
-      g_status.fps = currentFps;
+      g_status.fps = g_streamFps;
       g_status.frameCount++;
       g_status.sceneLuma = sceneLuma;
-      g_status.flashDutyApplied = currentDuty;
       snprintf(g_status.lastResult, sizeof(g_status.lastResult), "%s", resultLabel);
       snprintf(g_status.lastMatchName, sizeof(g_status.lastMatchName), "%s", matchedName);
 
@@ -578,15 +1115,29 @@ void faceWorkerTask(void * /*param*/) {
           snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
                    "Enroll failed (Flash full or bad alignment)");
         }
-      } else if (enrollActive && enrolledNow) {
-        syncEnrolledSnapshot(recognizer, g_status);
+      } else if (enrollActive && detected) {
+        if (faceGate == FACE_GATE_TOO_FAR) {
+          snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
+                   "Move closer to camera to enroll \"%s\"...", enrollTarget);
+        } else if (faceGate == FACE_GATE_TOO_CLOSE) {
+          snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
+                   "Step back slightly to enroll \"%s\"...", enrollTarget);
+        } else if (faceGate == FACE_GATE_OFF_CENTER) {
+          snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
+                   "Center your face inside the guide to enroll \"%s\"...", enrollTarget);
+        } else if (faceGate == FACE_GATE_BAD_POSE) {
+          snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
+                   "Look straight at the camera to enroll \"%s\"...", enrollTarget);
+        } else if (faceGate == FACE_GATE_BLURRY) {
+          snprintf(g_status.enrollMessage, sizeof(g_status.enrollMessage),
+                   "Hold steady for clear focus to enroll \"%s\"...", enrollTarget);
+        }
       }
       xSemaphoreGive(stateMutex);
     }
 
-    // Adaptive yield: short delay while actively recognizing (max throughput but
-    // still lets loopTask run HTTP + heartbeats on Core 1), longer delay when idle.
-    vTaskDelay(pdMS_TO_TICKS(detected || bestFace ? 1 : 5));
+    // Brief yield so HTTP server & ESP-NOW on Core 1 stay responsive
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
@@ -941,7 +1492,7 @@ void handleRoot() {
       </div>
 
       <div class="row">
-        <span>Auto Flash in Low Light</span>
+        <span>Auto Flash (Darkness + Motion, 5s Off)</span>
         <label class="switch"><input id="cfg-flash-auto" type="checkbox"><span class="slider"></span></label>
       </div>
 
@@ -1060,6 +1611,9 @@ let snapshotActive = false;
 let enrollWizardMode = 'single'; // 'single' or 'multi'
 let multiStep = 0; // 0=front, 1=left, 2=right
 let multiBaseName = '';
+let multiSessionActive = false;
+let multiStepTimer = null;
+let lastHandledEnrollMsg = '';
 let cfgLoaded = false;
 let clientFrames = 0;
 let lastFpsTs = performance.now();
@@ -1078,6 +1632,7 @@ function initCamera() {
   const streamUrl = window.location.protocol + '//' + window.location.hostname + ':81/stream';
 
   img.onload = () => {
+    mjpegFails = 0;
     clientFrames++;
     const now = performance.now();
     if (now - lastFpsTs >= 1000) {
@@ -1091,7 +1646,13 @@ function initCamera() {
   img.onerror = () => {
     if (currentMode === 'mjpeg') {
       mjpegFails++;
-      if (mjpegFails >= 2) {
+      if (mjpegFails <= 3) {
+        setTimeout(() => {
+          if (currentMode === 'mjpeg') {
+            img.src = window.location.protocol + '//' + window.location.hostname + ':81/stream?t=' + Date.now();
+          }
+        }, 600);
+      } else {
         console.warn('Switching to fast snapshot polling fallback');
         setStreamMode('snapshot');
       }
@@ -1162,18 +1723,28 @@ function setEnrollMode(mode) {
   document.getElementById('tab-single').className = 'tab-btn' + (mode === 'single' ? ' active' : '');
   document.getElementById('tab-multi').className = 'tab-btn' + (mode === 'multi' ? ' active' : '');
   multiStep = 0;
+  multiSessionActive = false;
+  if (multiStepTimer) {
+    clearTimeout(multiStepTimer);
+    multiStepTimer = null;
+  }
 }
 
-async function startEnrollment() {
+async function startEnrollment(isNextMultiStep) {
   const base = document.getElementById('ename').value.trim() || 'User';
-  multiBaseName = base;
-
-  let targetName = base;
-  if (enrollWizardMode === 'multi') {
-    const labels = ['Front', 'Left 15deg', 'Right 15deg'];
-    targetName = base + ' (' + labels[multiStep] + ')';
+  if (!isNextMultiStep) {
+    multiBaseName = base;
+    multiStep = 0;
+    multiSessionActive = (enrollWizardMode === 'multi');
   }
 
+  let targetName = multiBaseName || base;
+  if (enrollWizardMode === 'multi') {
+    const labels = ['Front', 'Left 15deg', 'Right 15deg'];
+    targetName = (multiBaseName || base) + ' (' + labels[multiStep] + ')';
+  }
+
+  lastHandledEnrollMsg = '';
   document.getElementById('enroll-btn').disabled = true;
   document.getElementById('cancel-btn').style.display = 'inline-flex';
   document.getElementById('prog-wrap').style.display = 'block';
@@ -1183,8 +1754,13 @@ async function startEnrollment() {
 }
 
 async function cancelEnrollment() {
-  await fetch('/api/enroll/cancel', { method: 'POST' });
+  if (multiStepTimer) {
+    clearTimeout(multiStepTimer);
+    multiStepTimer = null;
+  }
+  multiSessionActive = false;
   multiStep = 0;
+  await fetch('/api/enroll/cancel', { method: 'POST' });
   document.getElementById('enroll-btn').disabled = false;
   document.getElementById('cancel-btn').style.display = 'none';
   document.getElementById('prog-wrap').style.display = 'none';
@@ -1233,6 +1809,14 @@ async function refreshStatus() {
         qPill.textContent = 'CENTER FACE';
         qPill.className = 'hud-pill badge warn';
         guideBanner.textContent = 'Position face inside the guide';
+      } else if (d.faceQuality === 'BAD_POSE') {
+        qPill.textContent = 'LOOK STRAIGHT';
+        qPill.className = 'hud-pill badge warn';
+        guideBanner.textContent = 'Keep head upright & face the camera';
+      } else if (d.faceQuality === 'BLURRY') {
+        qPill.textContent = 'HOLD STEADY';
+        qPill.className = 'hud-pill badge warn';
+        guideBanner.textContent = 'Hold still for sharp focus';
       } else {
         qPill.textContent = 'PERFECT ALIGNMENT';
         qPill.className = 'hud-pill badge ok';
@@ -1288,10 +1872,27 @@ async function refreshStatus() {
       msgText.textContent = d.enrollMessage;
 
       // Check if multi-angle wizard was active and just finished a step
-      if (enrollWizardMode === 'multi' && d.enrollMessage.indexOf('Saved') !== -1 && multiStep < 2) {
-        multiStep++;
-        showToast('Step ' + multiStep + '/3 complete! Preparing next angle...');
-        setTimeout(() => startEnrollment(), 1400);
+      if (multiSessionActive && enrollWizardMode === 'multi' && d.enrollMessage !== lastHandledEnrollMsg) {
+        if (d.enrollMessage.indexOf('Saved') !== -1) {
+          lastHandledEnrollMsg = d.enrollMessage;
+          if (multiStep < 2) {
+            multiStep++;
+            showToast('Step ' + multiStep + '/3 complete! Preparing next angle...');
+            if (multiStepTimer) clearTimeout(multiStepTimer);
+            multiStepTimer = setTimeout(() => {
+              multiStepTimer = null;
+              startEnrollment(true);
+            }, 1400);
+          } else {
+            multiSessionActive = false;
+            multiStep = 0;
+            showToast('All 3 angles enrolled successfully!');
+          }
+        } else if (d.enrollMessage.indexOf('timed out') !== -1 || d.enrollMessage.indexOf('failed') !== -1) {
+          lastHandledEnrollMsg = d.enrollMessage;
+          multiSessionActive = false;
+          multiStep = 0;
+        }
       }
     }
 
@@ -1411,7 +2012,7 @@ void handlePreview() {
 
 void handleStatus() {
   FaceStatusSnapshot snap;
-  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
     snap = g_status;
     xSemaphoreGive(stateMutex);
   }
@@ -1425,6 +2026,7 @@ void handleStatus() {
   json += "\"ip\":\"" + camNetIpString() + "\",";
   json += "\"streamPort\":" + String(STREAM_PORT) + ",";
   json += "\"faceDetected\":" + String(snap.faceDetected ? "true" : "false") + ",";
+  json += "\"motionDetected\":" + String(snap.motionDetected ? "true" : "false") + ",";
   json += "\"faceQuality\":\"" + String(snap.faceQuality) + "\",";
   json += "\"faceBox\":[" + String(snap.faceBox[0]) + "," + String(snap.faceBox[1]) + "," +
           String(snap.faceBox[2]) + "," + String(snap.faceBox[3]) + "],";
@@ -1576,19 +2178,35 @@ void setup() {
   Serial.println("\n=== Smart Home Camera 1: Face Recognition & Live Stream (HW-297) ===");
 
   stateMutex = xSemaphoreCreateMutex();
+  g_overlayMutex = xSemaphoreCreateMutex();
+  g_aiStartSem = xSemaphoreCreateBinary();
+  g_aiFrameBuf = static_cast<uint8_t *>(ps_malloc(AI_FRAME_BYTES));
+  if (!g_aiFrameBuf) {
+    g_aiFrameBuf = static_cast<uint8_t *>(malloc(AI_FRAME_BYTES));
+  }
+  g_streamFrameBuf = static_cast<uint8_t *>(ps_malloc(AI_FRAME_BYTES));
+  if (!g_streamFrameBuf) {
+    g_streamFrameBuf = static_cast<uint8_t *>(malloc(AI_FRAME_BYTES));
+  }
   camHwInitPreview();
 
   FaceConfig cfg;
   loadConfigFromNvs(cfg);
-  // Camera disabled — focusing on main board RFID work.
-  // bool camOk = camHwInitCamera(PIXFORMAT_RGB565,
-  //                              FRAMESIZE_240X240,
-  //                              12,
-  //                              cfg.hmirror,
-  //                              cfg.vflip);
-  bool camOk = false;
+
+  // Initialize Wi-Fi PHY and ESP-NOW BEFORE starting the OV2640 camera so that
+  // the 3.3V RF calibration current spike finishes before OV2640 PLL/FIFO/AWB setup.
+  camNetInit(SmartHomeNet::CAM_SOURCE_FACE);
+
+  bool camOk = camHwInitCamera(PIXFORMAT_RGB565,
+                               FRAMESIZE_240X240,
+                               12,
+                               cfg.hmirror,
+                               cfg.vflip);
   if (camOk) {
-    camHwSetFlashLed(cfg.flashAuto ? cfg.flashDuty : cfg.flashDuty);
+    camHwSetFlashLed(cfg.flashAuto ? 0 : cfg.flashDuty);
+    Serial.println("[FACE] OV2640 camera initialized successfully (240x240 RGB565).");
+  } else {
+    Serial.println("[FACE] ERROR: OV2640 camera initialization failed!");
   }
   if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
     g_status.cfg = cfg;
@@ -1596,10 +2214,8 @@ void setup() {
     xSemaphoreGive(stateMutex);
   }
 
-  camNetInit(SmartHomeNet::CAM_SOURCE_FACE);
-
   // Dedicated real-time MJPEG streaming task on port 81
-  // camHwStartStreamServer(STREAM_PORT);
+  camHwStartStreamServer(STREAM_PORT);
 
   // HTTP Web Server routes on port 80
   server.on("/", HTTP_GET, handleRoot);
@@ -1621,23 +2237,28 @@ void setup() {
   server.on("/api/test", HTTP_POST, handleTest);
   server.begin();
 
-  // Dual-core split: Core 0 = Wi-Fi/lwIP + MJPEG stream (prio 1, set in cam_hw).
-  // Core 1 = face recognition worker (prio 2) + Arduino loop / HTTP + ESP-NOW (prio 1).
-  // Worker runs faster than loopTask so recognition never starves; it yields to
-  // loopTask during blocking frame grabs via vTaskDelay(0)/adaptive delay.
+  // ESP-WHO style dual-core split:
+  // Core 0 = Wi-Fi/lwIP + Camera DMA ISR + MJPEG stream server (prio 2) + camCaptureTask (prio 1).
+  // Core 1 = faceWorkerTask (prio 1, AI inference) + Arduino loop / HTTP + ESP-NOW (prio 1).
   vTaskPrioritySet(nullptr, 1);
 
-  // Face recognition worker disabled (camera off).
-  // if (camOk) {
-  //   xTaskCreatePinnedToCore(faceWorkerTask,
-  //                           "face_worker",
-  //                           16384,
-  //                           nullptr,
-  //                           2,
-  //                           nullptr,
-  //                           1); // Pin to Core 1 (Core 0 handles Wi-Fi + Stream)
-  //   Serial.println("Face worker started (Core 1, prio 2). loopTask prio 1.");
-  // }
+  if (camOk) {
+    xTaskCreatePinnedToCore(camCaptureTask,
+                            "cam_capture",
+                            8192,
+                            nullptr,
+                            1,
+                            nullptr,
+                            0); // Pin to Core 0 (prio 1, cooperative with prio 2 cam_stream)
+    xTaskCreatePinnedToCore(faceWorkerTask,
+                            "face_worker",
+                            24576, // 24 KB stack ensures generous headroom for MobileFaceNet S8
+                            nullptr,
+                            1, // Equal priority to loopTask for cooperative execution
+                            nullptr,
+                            1); // Pin to Core 1
+    Serial.println("[FACE] ESP-WHO decoupled capture (Core 0) + AI worker (Core 1) started.");
+  }
 }
 
 void loop() {
