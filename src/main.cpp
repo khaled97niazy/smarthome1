@@ -312,21 +312,38 @@ bool isRfidHealthy() {
     return false;
   }
   byte txCtrl = rfid.PCD_ReadRegister(MFRC522::TxControlReg);
-  return (txCtrl & 0x03) == 0x03;
+  if ((txCtrl & 0x03) != 0x03) {
+    return false;
+  }
+  // Verify registers configured by PCD_Init() to catch brownout/power-glitch resets
+  byte tMode = rfid.PCD_ReadRegister(MFRC522::TModeReg);
+  byte txAuto = rfid.PCD_ReadRegister(MFRC522::TxAutoReg);
+  return (tMode == 0x80) && (txAuto == 0x40);
+}
+
+void hardwareResetRfidPin() {
+  pinMode(RFID_SS_PIN, OUTPUT);
+  digitalWrite(RFID_SS_PIN, HIGH);
+  pinMode(RFID_RST_PIN, OUTPUT);
+  digitalWrite(RFID_RST_PIN, LOW);
+  delay(5);
+  digitalWrite(RFID_RST_PIN, HIGH);
+  delay(15);
 }
 
 bool initRfidReader(bool resetSpi) {
   if (resetSpi) {
     SPI.end();
-    delay(5);
+    delay(2);
     SPI.begin(RFID_SCK_PIN, RFID_MISO_PIN, RFID_MOSI_PIN, RFID_SS_PIN);
   }
 
   for (int attempt = 1; attempt <= RFID_INIT_ATTEMPTS; attempt++) {
+    hardwareResetRfidPin();
     rfid.PCD_Init();
     rfid.PCD_SetAntennaGain(rfid.RxGain_max);
     rfid.PCD_AntennaOn();
-    delay(5);
+    delay(3);
 
     if (isRfidHealthy()) {
       byte ver = rfid.PCD_ReadRegister(MFRC522::VersionReg);
@@ -335,7 +352,7 @@ bool initRfidReader(bool resetSpi) {
       rfidOnline = true;
       return true;
     }
-    delay(10);
+    delay(5);
   }
 
   rfidOnline = false;
@@ -501,12 +518,12 @@ int servoAngleToPulseUs(int angle) {
 
 bool attachGateServo(Servo &servo, int pin, int initialAngle, const char *label) {
   servo.setPeriodHertz(SERVO_PWM_FREQ_HZ);
+  servo.setTimerWidth(SERVO_PWM_RES_BITS);
   servo.attach(pin, SERVO_MIN_US, SERVO_MAX_US);
   if (!servo.attached()) {
     Serial.printf("WARNING: Failed to attach %s on GPIO%d\n", label, pin);
     return false;
   }
-  servo.setTimerWidth(SERVO_PWM_RES_BITS);
   servo.writeMicroseconds(servoAngleToPulseUs(initialAngle));
   return true;
 }
@@ -2122,9 +2139,14 @@ async function refreshStatus(){
       document.getElementById('rfidUidText').textContent = d.rfid.lastUid ? d.rfid.lastUid : "NO CARD SCANNED";
       document.getElementById('rfidAccepted').textContent = d.rfid.acceptedUid;
       document.getElementById('rfidLastSeen').textContent = d.rfid.lastScanSec < 9999 ? (d.rfid.lastScanSec + "s ago") : "---";
-      const isAuth = (d.rfid.lastUid === d.rfid.acceptedUid);
-      document.getElementById('rfidStatus').textContent = isAuth ? "AUTHORIZED" : (d.rfid.lastUid ? "DENIED" : "ACTIVE");
-      document.getElementById('rfidStatus').className = "badge " + (isAuth ? "b-ok" : (d.rfid.lastUid ? "b-bad" : "b-ok"));
+      if (d.rfid.online === false) {
+        document.getElementById('rfidStatus').textContent = "RECOVERING";
+        document.getElementById('rfidStatus').className = "badge b-warn";
+      } else {
+        const isAuth = (d.rfid.lastUid === d.rfid.acceptedUid);
+        document.getElementById('rfidStatus').textContent = isAuth ? "AUTHORIZED" : (d.rfid.lastUid ? "DENIED" : "ACTIVE");
+        document.getElementById('rfidStatus').className = "badge " + (isAuth ? "b-ok" : (d.rfid.lastUid ? "b-bad" : "b-ok"));
+      }
     }
 
     // Populate Settings once
@@ -2323,7 +2345,7 @@ void setup() {
   initDefaultSystemTime();
   loadConfigFromNvs();
 
-  // Servo timers (allocate Timers 0 & 1 for gate & door servos)
+  // Servo timers (allocate Timers 0 & 1 for gate & door servos; Timer 2 = siren, Timer 3 = voice)
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   attachGateServo(gateServo1, GATE_SERVO_1_PIN, currentServo1Angle, "gate servo 1");
@@ -2439,39 +2461,41 @@ void loop() {
         uid += String(rfid.uid.uidByte[i], HEX);
       }
       uid.toUpperCase();
-      if (uid != lastRfidUid || (now - lastRfidPrintMs >= RFID_PRINT_INTERVAL_MS)) {
-        lastRfidUid = uid;
-        lastRfidPrintMs = now;
-        Serial.print("[RFID] Card UID: ");
-        Serial.println(uid);
+      bool shouldLog = (uid != lastRfidUid || (now - lastRfidPrintMs >= RFID_PRINT_INTERVAL_MS));
+      lastRfidUid = uid;
 
-        if (uid == ACCEPTED_RFID_UID) {
-          plateGateUntilMs = now + g_cfg.gateHoldMs;
-          setGateOpen(true);
+      if (uid == ACCEPTED_RFID_UID) {
+        plateGateUntilMs = now + g_cfg.gateHoldMs;
+        setGateOpen(true);
+        if (shouldLog) {
+          lastRfidPrintMs = now;
+          Serial.print("[RFID] Card UID: ");
+          Serial.println(uid);
           if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_ACCESS_GRANTED);
           char msg[72];
           snprintf(msg, sizeof(msg), "RFID Authorized [%s] -> Car Gate opened", uid.c_str());
           addEventLog("success", msg);
           Serial.println("[RFID] Accepted card -> Gate opened (Servos 1 & 2 to 160°)");
-        } else {
-          camAlarmUntilMs = now + g_cfg.camAlarmMs;
-          startSiren(now);
-          if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_ACCESS_DENIED);
-          char msg[72];
-          snprintf(msg, sizeof(msg), "RFID Unknown [%s] -> Intruder alarm", uid.c_str());
-          addEventLog("danger", msg);
-          Serial.println("[RFID] Unknown card -> Intruder alarm started");
         }
+      } else if (shouldLog) {
+        lastRfidPrintMs = now;
+        Serial.print("[RFID] Card UID: ");
+        Serial.println(uid);
+        camAlarmUntilMs = now + g_cfg.camAlarmMs;
+        startSiren(now);
+        if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_ACCESS_DENIED);
+        char msg[72];
+        snprintf(msg, sizeof(msg), "RFID Unknown [%s] -> Intruder alarm", uid.c_str());
+        addEventLog("danger", msg);
+        Serial.println("[RFID] Unknown card -> Intruder alarm started");
       }
       rfid.PICC_HaltA();
       rfid.PCD_StopCrypto1();
     } else {
-      // Card present but serial read failed — log occasionally for diagnostics
-      static unsigned long lastRfidReadFailMs = 0;
-      if (now - lastRfidReadFailMs >= 2000) {
-        lastRfidReadFailMs = now;
-        Serial.println("[RFID] Card present but read serial failed — check antenna/power");
-      }
+      // Mid-transaction read failure (e.g. loose wire glitch) -> clean up & re-check health immediately
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+      lastRfidHealthMs = now - RFID_HEALTH_CHECK_MS;
     }
   }
 
