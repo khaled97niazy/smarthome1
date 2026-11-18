@@ -47,7 +47,9 @@ constexpr int ULTRASONIC_TRIG_PIN = 32; // HC-SR04 TRIG (digital OUT)
 constexpr int ULTRASONIC_ECHO_PIN = 33; // HC-SR04 ECHO (digital IN; level shifted 5V->3.3V)
 constexpr int BUZZER_PIN          = 25; // Siren buzzer output (LEDC tone)
 constexpr int AMPLIFIER_PIN       = 4;  // HW-104 PAM8403 Voice Speaker (LEDC PWM Audio)
-constexpr int LIGHT_PIN           = 21; // Smart Light relay / transistor driver (digital OUT)
+constexpr int LIGHT_PIN           = 21; // Smart Light relay / transistor driver (digital OUT, active-LOW)
+constexpr int LIGHT_ON_LEVEL      = LOW;  // Reversed polarity: LOW turns light ON
+constexpr int LIGHT_OFF_LEVEL     = HIGH; // Reversed polarity: HIGH turns light OFF
 constexpr int GATE_SERVO_1_PIN    = 18; // Left car gate servo
 constexpr int GATE_SERVO_2_PIN    = 19; // Right car gate servo
 constexpr int DOOR_SERVO_3_PIN    = 26; // Pedestrian door servo
@@ -78,10 +80,11 @@ constexpr unsigned long SERVO_STEP_INTERVAL_MS = 20;
 constexpr int SIREN_LEDC_CHANNEL  = 4;
 constexpr int AUDIO_LEDC_CHANNEL  = 6;
 constexpr int SIREN_RESOLUTION_BITS = 8;
-constexpr int SIREN_LOW_HZ        = 700;
-constexpr int SIREN_HIGH_HZ       = 1800;
-constexpr int SIREN_STEP_HZ       = 60;
-constexpr unsigned long SIREN_STEP_MS = 20;
+constexpr int SIREN_DUTY_50_PCT   = (1 << (SIREN_RESOLUTION_BITS - 1)); // 50% duty for max speaker RMS power
+constexpr int SIREN_LOW_HZ        = 1000; // Resonant low frequency for mini-speakers / piezo
+constexpr int SIREN_HIGH_HZ       = 3000; // Resonant high frequency for loud, clear siren
+constexpr int SIREN_STEP_HZ       = 100;
+constexpr unsigned long SIREN_STEP_MS = 15;
 
 // ---------------------------------------------------------------------------
 // Ultrasonic Timing Constants
@@ -105,9 +108,13 @@ constexpr uint8_t RFID_MISO_PIN = 12;
 MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
 unsigned long lastRfidPrintMs = 0;
 constexpr unsigned long RFID_PRINT_INTERVAL_MS = 2000;
+constexpr unsigned long RFID_HEALTH_CHECK_MS   = 1000;
+constexpr int RFID_INIT_ATTEMPTS               = 3;
 String lastRfidUid;
-bool rfidInitOk = false;
-uint8_t rfidChipVersion = 0;
+bool rfidOnline = false;
+bool rfidDisconnectedLogged = false;
+unsigned long lastRfidHealthMs = 0;
+uint32_t rfidReinitCount = 0;
 
 // Accepted RFID card UID — triggers the car gate (Servos 1 & 2 to 160°) when presented.
 constexpr char ACCEPTED_RFID_UID[] = "52411902";
@@ -287,13 +294,69 @@ bool isPirScheduleActive() {
 void setLightState(bool on) {
   if (lightState == on) return;
   lightState = on;
-  digitalWrite(LIGHT_PIN, lightState ? HIGH : LOW);
+  digitalWrite(LIGHT_PIN, lightState ? LIGHT_ON_LEVEL : LIGHT_OFF_LEVEL);
   if (g_cfg.voiceSpokenEnabled) {
     speakSentence(lightState ? VOICE_SENT_LIGHT_ON : VOICE_SENT_LIGHT_OFF);
   } else {
     playVoicePrompt(lightState ? VOICE_LIGHT_ON : VOICE_LIGHT_OFF);
   }
   addEventLog("info", lightState ? "Smart Light turned ON (GPIO21)" : "Smart Light turned OFF (GPIO21)");
+}
+
+// ---------------------------------------------------------------------------
+// RFID Reader Health Check & Multiple Initialization (Loose-Wire Recovery)
+// ---------------------------------------------------------------------------
+bool isRfidHealthy() {
+  byte ver = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+  if (ver == 0x00 || ver == 0xFF) {
+    return false;
+  }
+  byte txCtrl = rfid.PCD_ReadRegister(MFRC522::TxControlReg);
+  if ((txCtrl & 0x03) != 0x03) {
+    return false;
+  }
+  // Verify registers configured by PCD_Init() to catch brownout/power-glitch resets
+  byte tMode = rfid.PCD_ReadRegister(MFRC522::TModeReg);
+  byte txAuto = rfid.PCD_ReadRegister(MFRC522::TxAutoReg);
+  return (tMode == 0x80) && (txAuto == 0x40);
+}
+
+void hardwareResetRfidPin() {
+  pinMode(RFID_SS_PIN, OUTPUT);
+  digitalWrite(RFID_SS_PIN, HIGH);
+  pinMode(RFID_RST_PIN, OUTPUT);
+  digitalWrite(RFID_RST_PIN, LOW);
+  delay(5);
+  digitalWrite(RFID_RST_PIN, HIGH);
+  delay(15);
+}
+
+bool initRfidReader(bool resetSpi) {
+  if (resetSpi) {
+    SPI.end();
+    delay(2);
+    SPI.begin(RFID_SCK_PIN, RFID_MISO_PIN, RFID_MOSI_PIN, RFID_SS_PIN);
+  }
+
+  for (int attempt = 1; attempt <= RFID_INIT_ATTEMPTS; attempt++) {
+    hardwareResetRfidPin();
+    rfid.PCD_Init();
+    rfid.PCD_SetAntennaGain(rfid.RxGain_max);
+    rfid.PCD_AntennaOn();
+    delay(3);
+
+    if (isRfidHealthy()) {
+      byte ver = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+      Serial.printf("[RFID] Reader initialized (attempt %d/%d, VersionReg=0x%02X)\n",
+                    attempt, RFID_INIT_ATTEMPTS, ver);
+      rfidOnline = true;
+      return true;
+    }
+    delay(5);
+  }
+
+  rfidOnline = false;
+  return false;
 }
 
 // Non-blocking interrupt-driven HC-SR04 state
@@ -455,12 +518,12 @@ int servoAngleToPulseUs(int angle) {
 
 bool attachGateServo(Servo &servo, int pin, int initialAngle, const char *label) {
   servo.setPeriodHertz(SERVO_PWM_FREQ_HZ);
+  servo.setTimerWidth(SERVO_PWM_RES_BITS);
   servo.attach(pin, SERVO_MIN_US, SERVO_MAX_US);
   if (!servo.attached()) {
     Serial.printf("WARNING: Failed to attach %s on GPIO%d\n", label, pin);
     return false;
   }
-  servo.setTimerWidth(SERVO_PWM_RES_BITS);
   servo.writeMicroseconds(servoAngleToPulseUs(initialAngle));
   return true;
 }
@@ -692,6 +755,7 @@ void startSiren(unsigned long now) {
   lastSirenMs = now;
   if (buzzerAttached && !g_cfg.sirenMuted) {
     ledcWriteTone(SIREN_LEDC_CHANNEL, sirenHz);
+    ledcWrite(SIREN_LEDC_CHANNEL, SIREN_DUTY_50_PCT);
   }
   if (!g_cfg.sirenMuted) {
     setVoiceSirenTone(sirenHz);
@@ -702,6 +766,7 @@ void startSiren(unsigned long now) {
 void stopSiren() {
   if (!sirenActive) return;
   if (buzzerAttached) {
+    ledcWrite(SIREN_LEDC_CHANNEL, 0);
     ledcWriteTone(SIREN_LEDC_CHANNEL, 0);
   } else {
     digitalWrite(BUZZER_PIN, LOW);
@@ -715,6 +780,7 @@ void stopSiren() {
 void updateSiren(unsigned long now) {
   if (!buzzerAttached) return;
   if (g_cfg.sirenMuted) {
+    ledcWrite(SIREN_LEDC_CHANNEL, 0);
     ledcWriteTone(SIREN_LEDC_CHANNEL, 0);
     setVoiceSirenTone(0);
     return;
@@ -731,6 +797,7 @@ void updateSiren(unsigned long now) {
     sirenDirection = 1;
   }
   ledcWriteTone(SIREN_LEDC_CHANNEL, sirenHz);
+  ledcWrite(SIREN_LEDC_CHANNEL, SIREN_DUTY_50_PCT);
   setVoiceSirenTone(sirenHz);
 }
 
@@ -1041,6 +1108,8 @@ void handleApiStatus() {
 
   // RFID Telemetry
   json += "\"rfid\":{";
+  json += "\"online\":" + String(rfidOnline ? "true" : "false") + ",";
+  json += "\"reinitCount\":" + String(rfidReinitCount) + ",";
   json += "\"lastUid\":\"" + lastRfidUid + "\",";
   json += "\"acceptedUid\":\"" + String(ACCEPTED_RFID_UID) + "\",";
   json += "\"lastScanSec\":" + String(lastRfidPrintMs > 0 ? ((now - lastRfidPrintMs) / 1000) : 9999);
@@ -1561,8 +1630,8 @@ void handleRoot() {
         <span>💡 Smart Lighting</span>
         <span id="lightBadge" class="badge b-off">LIGHT OFF</span>
       </div>
-      <div class="row"><span class="k">Output Control</span><span class="v">GPIO 21 (Relay / Transistor)</span></div>
-      <div class="row"><span class="k">Current State</span><span id="lightStateText" class="v">OFF (0V)</span></div>
+      <div class="row"><span class="k">Output Control</span><span class="v">GPIO 21 (Active-LOW Drive)</span></div>
+      <div class="row"><span class="k">Current State</span><span id="lightStateText" class="v">OFF (HIGH / 3.3V)</span></div>
       <div class="cam-actions" style="margin-top:10px">
         <button id="btnLightToggle" onclick="triggerAction('light_toggle')">Toggle Light</button>
         <button class="secondary" onclick="triggerAction('light_on')">Turn ON</button>
@@ -1967,12 +2036,12 @@ async function refreshStatus(){
     if (d.lightState) {
       lBadge.textContent = "LIGHT ON";
       lBadge.className = "badge b-ok";
-      lText.textContent = "ON (3.3V Active on GPIO21)";
+      lText.textContent = "ON (LOW / Active on GPIO21)";
       document.getElementById('btnLightToggle').textContent = "Turn OFF";
     } else {
       lBadge.textContent = "LIGHT OFF";
       lBadge.className = "badge b-off";
-      lText.textContent = "OFF (0V Idle on GPIO21)";
+      lText.textContent = "OFF (HIGH / Idle on GPIO21)";
       document.getElementById('btnLightToggle').textContent = "Turn ON";
     }
 
@@ -2070,9 +2139,14 @@ async function refreshStatus(){
       document.getElementById('rfidUidText').textContent = d.rfid.lastUid ? d.rfid.lastUid : "NO CARD SCANNED";
       document.getElementById('rfidAccepted').textContent = d.rfid.acceptedUid;
       document.getElementById('rfidLastSeen').textContent = d.rfid.lastScanSec < 9999 ? (d.rfid.lastScanSec + "s ago") : "---";
-      const isAuth = (d.rfid.lastUid === d.rfid.acceptedUid);
-      document.getElementById('rfidStatus').textContent = isAuth ? "AUTHORIZED" : (d.rfid.lastUid ? "DENIED" : "ACTIVE");
-      document.getElementById('rfidStatus').className = "badge " + (isAuth ? "b-ok" : (d.rfid.lastUid ? "b-bad" : "b-ok"));
+      if (d.rfid.online === false) {
+        document.getElementById('rfidStatus').textContent = "RECOVERING";
+        document.getElementById('rfidStatus').className = "badge b-warn";
+      } else {
+        const isAuth = (d.rfid.lastUid === d.rfid.acceptedUid);
+        document.getElementById('rfidStatus').textContent = isAuth ? "AUTHORIZED" : (d.rfid.lastUid ? "DENIED" : "ACTIVE");
+        document.getElementById('rfidStatus').className = "badge " + (isAuth ? "b-ok" : (d.rfid.lastUid ? "b-bad" : "b-ok"));
+      }
     }
 
     // Populate Settings once
@@ -2251,9 +2325,11 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 
+  digitalWrite(LIGHT_PIN, LIGHT_OFF_LEVEL);
   pinMode(LIGHT_PIN, OUTPUT);
-  digitalWrite(LIGHT_PIN, LOW);
 
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
   pinMode(FIRE_SENSOR_PIN, INPUT);
   pinMode(MQ2_SENSOR_PIN, INPUT);
   pinMode(PIR_SENSOR_PIN, INPUT_PULLDOWN);
@@ -2269,7 +2345,7 @@ void setup() {
   initDefaultSystemTime();
   loadConfigFromNvs();
 
-  // Servo timers (allocate Timers 0 & 1 for gate & door servos)
+  // Servo timers (allocate Timers 0 & 1 for gate & door servos; Timer 2 = siren, Timer 3 = voice)
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   attachGateServo(gateServo1, GATE_SERVO_1_PIN, currentServo1Angle, "gate servo 1");
@@ -2289,37 +2365,14 @@ void setup() {
   initMicI2S();
   registerVoiceCommandCallback(onVoiceCommandReceived);
 
-  // RFID reader init (MFRC522)
-  // Explicit hard-reset pulse on RST before init: ESP32 soft-reset alone is often
-  // unreliable and can leave the MFRC522 in a non-responsive state.
-  pinMode(RFID_RST_PIN, OUTPUT);
-  digitalWrite(RFID_RST_PIN, LOW);
-  delayMicroseconds(100);
-  digitalWrite(RFID_RST_PIN, HIGH);
-  delay(50);  // MFRC522 oscillator start-up time
-
+  // RFID reader init (MFRC522) — multiple attempts for loose-wire resilience
   SPI.begin(RFID_SCK_PIN, RFID_MISO_PIN, RFID_MOSI_PIN, RFID_SS_PIN);
-
-  // Raw SPI diagnostic: read VersionReg (0x37) directly to verify SPI comms
-  // independent of the library's register addressing convention.
-  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(RFID_SS_PIN, LOW);
-  SPI.transfer(0x80 | 0x37);   // read VersionReg
-  uint8_t rawVersion = SPI.transfer(0);
-  digitalWrite(RFID_SS_PIN, HIGH);
-  SPI.endTransaction();
-  Serial.print("[RFID] Raw SPI VersionReg: 0x");
-  Serial.println(rawVersion, HEX);
-
-  rfid.PCD_Init();
-  rfidChipVersion = rfid.PCD_ReadRegister(MFRC522::VersionReg);
-  rfidInitOk = (rfidChipVersion != 0x00 && rfidChipVersion != 0xFF);
-  Serial.print("[RFID] Reader init: chip version 0x");
-  Serial.println(rfidChipVersion, HEX);
-  if (!rfidInitOk) {
-    Serial.println("[RFID] ERROR: MFRC522 not responding on SPI — check: VCC=3.3V (not 5V), RST not held low, adequate 3.3V current for antenna, SS=GPIO5 pulled up to 3.3V");
+  if (initRfidReader(false)) {
+    Serial.println("[RFID] Reader ready. Present a card to read its UID.");
   } else {
-    Serial.println("[RFID] Reader initialized. Present a card to read its UID.");
+    Serial.println("[RFID] WARNING: Reader not detected at boot — will auto-reinitialize in loop.");
+    addEventLog("warning", "RFID reader not detected at boot; auto-recovery active");
+    rfidDisconnectedLogged = true;
   }
 
   // Network initialization
@@ -2376,13 +2429,31 @@ void loop() {
   // 4. Update non-blocking ultrasonic sensor
   updateUltrasonicSensor(now);
 
-  // 4b. RFID card reader — controls main car gate (Servos 1 & 2 to 160°)
-  if (!rfidInitOk) {
-    if (now - lastRfidPrintMs >= 10000) {
-      lastRfidPrintMs = now;
-      Serial.println("[RFID] Reader not initialized — skipping card reads");
+  // 4b. RFID reader health check & loose-wire auto-reinitialization
+  if (now - lastRfidHealthMs >= RFID_HEALTH_CHECK_MS) {
+    lastRfidHealthMs = now;
+    if (!isRfidHealthy()) {
+      rfidOnline = false;
+      if (!rfidDisconnectedLogged) {
+        rfidDisconnectedLogged = true;
+        Serial.println("[RFID] Connection lost (loose wire or reset). Attempting re-initialization...");
+        addEventLog("warning", "RFID reader disconnected; attempting re-initialization");
+      }
+      if (initRfidReader(true)) {
+        rfidReinitCount++;
+        rfidDisconnectedLogged = false;
+        Serial.printf("[RFID] Reader recovered (reinit #%lu)\n",
+                      static_cast<unsigned long>(rfidReinitCount));
+        addEventLog("info", "RFID reader re-initialized and recovered");
+      }
+    } else if (!rfidOnline) {
+      rfidOnline = true;
+      rfidDisconnectedLogged = false;
     }
-  } else if (rfid.PICC_IsNewCardPresent()) {
+  }
+
+  // 4c. RFID card reader — controls main car gate (Servos 1 & 2 to 160°)
+  if (rfidOnline && rfid.PICC_IsNewCardPresent()) {
     if (rfid.PICC_ReadCardSerial()) {
       String uid;
       for (byte i = 0; i < rfid.uid.size; i++) {
@@ -2390,39 +2461,41 @@ void loop() {
         uid += String(rfid.uid.uidByte[i], HEX);
       }
       uid.toUpperCase();
-      if (uid != lastRfidUid || (now - lastRfidPrintMs >= RFID_PRINT_INTERVAL_MS)) {
-        lastRfidUid = uid;
-        lastRfidPrintMs = now;
-        Serial.print("[RFID] Card UID: ");
-        Serial.println(uid);
+      bool shouldLog = (uid != lastRfidUid || (now - lastRfidPrintMs >= RFID_PRINT_INTERVAL_MS));
+      lastRfidUid = uid;
 
-        if (uid == ACCEPTED_RFID_UID) {
-          plateGateUntilMs = now + g_cfg.gateHoldMs;
-          setGateOpen(true);
+      if (uid == ACCEPTED_RFID_UID) {
+        plateGateUntilMs = now + g_cfg.gateHoldMs;
+        setGateOpen(true);
+        if (shouldLog) {
+          lastRfidPrintMs = now;
+          Serial.print("[RFID] Card UID: ");
+          Serial.println(uid);
           if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_ACCESS_GRANTED);
           char msg[72];
           snprintf(msg, sizeof(msg), "RFID Authorized [%s] -> Car Gate opened", uid.c_str());
           addEventLog("success", msg);
           Serial.println("[RFID] Accepted card -> Gate opened (Servos 1 & 2 to 160°)");
-        } else {
-          camAlarmUntilMs = now + g_cfg.camAlarmMs;
-          startSiren(now);
-          if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_ACCESS_DENIED);
-          char msg[72];
-          snprintf(msg, sizeof(msg), "RFID Unknown [%s] -> Intruder alarm", uid.c_str());
-          addEventLog("danger", msg);
-          Serial.println("[RFID] Unknown card -> Intruder alarm started");
         }
+      } else if (shouldLog) {
+        lastRfidPrintMs = now;
+        Serial.print("[RFID] Card UID: ");
+        Serial.println(uid);
+        camAlarmUntilMs = now + g_cfg.camAlarmMs;
+        startSiren(now);
+        if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_ACCESS_DENIED);
+        char msg[72];
+        snprintf(msg, sizeof(msg), "RFID Unknown [%s] -> Intruder alarm", uid.c_str());
+        addEventLog("danger", msg);
+        Serial.println("[RFID] Unknown card -> Intruder alarm started");
       }
       rfid.PICC_HaltA();
       rfid.PCD_StopCrypto1();
     } else {
-      // Card present but serial read failed — log occasionally for diagnostics
-      static unsigned long lastRfidReadFailMs = 0;
-      if (now - lastRfidReadFailMs >= 2000) {
-        lastRfidReadFailMs = now;
-        Serial.println("[RFID] Card present but read serial failed — check antenna/power");
-      }
+      // Mid-transaction read failure (e.g. loose wire glitch) -> clean up & re-check health immediately
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+      lastRfidHealthMs = now - RFID_HEALTH_CHECK_MS;
     }
   }
 
